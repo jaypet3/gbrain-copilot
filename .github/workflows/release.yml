@@ -1,11 +1,11 @@
 name: Release
 
-# Publishes a GitHub release for every VERSION bump that lands on master:
+# Publishes a GitHub release for every VERSION bump that lands on main:
 # tag + title `v<VERSION>`, notes from that version's CHANGELOG.md entry,
 # compiled binaries attached (#3521).
 #
 # Why every bump: `gbrain check-update` resolves the latest version from the
-# VERSION file on master, but binary self-update
+# VERSION file on main, but binary self-update
 # (src/core/binary-self-update.ts) downloads assets from `releases/latest`.
 # If releases lag VERSION, binary installs are told an upgrade exists that
 # self-update cannot apply. Keeping releases/latest == VERSION closes that gap.
@@ -20,12 +20,12 @@ name: Release
 # src/core/binary-self-update.ts, pinned by test/release-workflow.test.ts.
 #
 # CI gate (docs/RELEASING.md#release-ci-gate): the `ci-gate` job waits for
-# the push-to-master runs of Test and E2E Tests on the release commit
+# the push-to-main run of Test on the release commit
 # (scripts/release-gate.ts). Build, publication and the latest-stable move
-# run only after both succeed. A failed run publishes nothing and the job
+# run only after it succeeds. E2E is dispatch-only. A failed run publishes nothing and the job
 # fails with the next step; a run cancelled by a newer push is followed to
-# the next master commit with the same VERSION (published there) or marks
-# this version superseded; workflow_dispatch backfills master HEAD's VERSION
+# the next main commit with the same VERSION (published there) or marks
+# this version superseded; workflow_dispatch backfills main HEAD's VERSION
 # through the same gate.
 
 on:
@@ -81,7 +81,6 @@ jobs:
       publish: ${{ steps.gate.outputs.publish }}
       sha: ${{ steps.gate.outputs.sha }}
       test_reused_run_id: ${{ steps.gate.outputs.test_reused_run_id }}
-      e2e_reused_run_id: ${{ steps.gate.outputs.e2e_reused_run_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
@@ -96,7 +95,7 @@ jobs:
       - name: Refuse a since 'TBD' BEHAVIOR_CHANGES row
         run: bun scripts/check-behavior-since.ts --stamped
       - id: gate
-        name: Wait for Test and E2E Tests on the release commit
+        name: Wait for Test on the release commit
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
@@ -212,17 +211,14 @@ jobs:
           files: |
             artifacts/gbrain-darwin-arm64/gbrain-darwin-arm64
             artifacts/gbrain-linux-x64/gbrain-linux-x64
-      # [C1 = D6-A] `latest-stable` is the single sanctioned distribution ref:
-      # the README paste block, the BOOTSTRAP_FOR_AGENTS.md fetch URL, and
-      # `bun install -g github:garrytan/gbrain#latest-stable` all reference it
-      # permanently, so paste blocks copied into the wild never rot and there
-      # is no 404 window between VERSION landing and assets publishing. It is
+      # The fork's alpha update check and install surfaces follow main, not
+      # this tag (src/core/install-ref.ts). latest-stable is
       # a maintainer-controlled tag advanced ONLY here — the FINAL step of the
       # release job, after binaries + provenance attestation have fully
       # published — so a half-built release never moves it. The force-move
       # (`+`) is intentional: latest-stable tracks the newest verified release;
       # per-release history lives in the immutable v<VERSION> tags.
-      # scripts/check-bootstrap-tag.sh keeps the entry docs pinned to this ref.
+      # scripts/check-bootstrap-tag.sh keeps the entry docs pinned to INSTALL_REF.
       #
       # If this step ALONE fails, re-advance by hand (a full re-run would skip:
       # the release already exists with all assets):
@@ -239,7 +235,8 @@ jobs:
   #   1. The release above fully published (needs: release + the exists gate).
   #   2. The vendored tree templates/bootstrap/template-repo/ exists — the
   #      generator/doors work may not have landed yet; skip, never fail.
-  #   3. The TEMPLATE_REPO_PAT secret is configured. Secrets are not readable
+  #   3. The TEMPLATE_REPO variable explicitly names the fork's template repo.
+  #   4. The TEMPLATE_REPO_PAT secret is configured. Secrets are not readable
   #      in job-level `if:` expressions, so the secret is bound to env (the
   #      same env-indirection pattern as the release-notes step) and checked
   #      by the gate step's shell.
@@ -256,18 +253,22 @@ jobs:
       contents: read
     env:
       TEMPLATE_REPO_PAT: ${{ secrets.TEMPLATE_REPO_PAT }}
-      # owner/name of the template repo; override via repository variable.
-      TEMPLATE_REPO: ${{ vars.TEMPLATE_REPO || 'garrytan/gbrain-agent-template' }}
+      # Forks must explicitly select an owned destination; never default to upstream.
+      TEMPLATE_REPO: ${{ vars.TEMPLATE_REPO }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           ref: ${{ needs.ci-gate.outputs.sha }}
       - id: gate
-        name: Gate on PAT + vendored template tree
+        name: Gate on destination, PAT and vendored template tree
         run: |
           # A skip here is visible (warning + step summary), never a silent
           # green: this release did not publish the agent template (D-10).
-          if [ -z "$TEMPLATE_REPO_PAT" ]; then
+          if [ -z "$TEMPLATE_REPO" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Agent template NOT published — set the TEMPLATE_REPO repository variable to an owned template repository."
+            echo "## Agent template not published: TEMPLATE_REPO is unset" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -z "$TEMPLATE_REPO_PAT" ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "::warning::Agent template NOT published to $TEMPLATE_REPO — the TEMPLATE_REPO_PAT secret is empty. Why: only the repo owner can set secrets. Fix (owner-only): gh secret set TEMPLATE_REPO_PAT (fine-grained PAT with contents: write on $TEMPLATE_REPO), then re-run this release workflow."
             {

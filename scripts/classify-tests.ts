@@ -35,7 +35,7 @@
  *   bun scripts/classify-tests.ts --summary  # print counts only
  */
 import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative, sep } from 'node:path';
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const OUT_TSV = join(REPO_ROOT, 'scripts', 'structural-suites.tsv');
@@ -205,7 +205,7 @@ export function generate(): { tsv: string; suites: number; cases: number; files:
   const rows: SuiteRow[] = [];
   const unknown: string[] = [];
   for (const f of listTestFiles(testDir)) {
-    const rel = relative(REPO_ROOT, f);
+    const rel = relative(REPO_ROOT, f).split(sep).join('/');
     const res = classifyFile(rel, readFileSync(f, 'utf-8'));
     rows.push(...res.rows);
     if (res.unknown) unknown.push(rel);

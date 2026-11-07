@@ -22,6 +22,7 @@ import { keptEmbeddingIdentity, keptEmbeddingNotice } from './init-embedding-pla
 import { writeCliNotices } from '../core/interop-notices.ts';
 import { exitCodeForCode } from '../core/error-catalogue.ts';
 import { promptLineStderr } from '../core/interaction.ts';
+import { DEFAULT_RELEASE_CHANNEL } from '../core/self-upgrade.ts';
 import type { SearchMode as SearchModeName } from '../core/search/mode.ts';
 import type { McpSurface } from '../mcp/surface.ts';
 
@@ -1245,7 +1246,7 @@ export async function initPGLite(opts: {
     // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
-    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: 'stable' as const } : {}), ...(config.self_upgrade ?? {}) };
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: DEFAULT_RELEASE_CHANNEL } : {}), ...(config.self_upgrade ?? {}) };
     // MEMORY_VERBS v1 [D6C]: TTHW stamp — `gbrain protocol stats` derives
     // install→first-verb-call from this. Idempotent on re-init.
     config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
@@ -1587,7 +1588,7 @@ export async function initPostgresCore(opts: {
     // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
-    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: 'stable' as const } : {}), ...(config.self_upgrade ?? {}) };
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: DEFAULT_RELEASE_CHANNEL } : {}), ...(config.self_upgrade ?? {}) };
     // MEMORY_VERBS v1 [D6C]: TTHW stamp (see the PGLite path).
     config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
     preserveConversionConfig(false);

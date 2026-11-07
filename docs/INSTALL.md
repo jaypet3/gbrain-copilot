@@ -31,7 +31,7 @@ The paths below are the manual equivalents. Pick one; mix later if needed.
 Already running [OpenClaw](https://github.com/garrytan/openclaw) or [Hermes](https://github.com/garrytan/hermes)?
 
 ```bash
-bun install -g github:jaypetez/gbrain-copilot#latest-stable
+bun install -g github:jaypetez/gbrain-copilot#main
 gbrain init --pglite --no-embedding   # keyless; no server
 gbrain skillpack scaffold --harness openclaw --workspace <ws>   # OpenClaw: the five-skill brain-first core
 gbrain skillpack scaffold --all       # Hermes or any other workspace: every bundled skill (skills/manifest.json)
@@ -73,7 +73,7 @@ See the [agent upgrade steps](../INSTALL_FOR_AGENTS.md#upgrade).
 No agent platform, just shell + MCP-aware editor.
 
 ```bash
-bun install -g github:jaypetez/gbrain-copilot#latest-stable
+bun install -g github:jaypetez/gbrain-copilot#main
 gbrain init --pglite --no-embedding
 ```
 

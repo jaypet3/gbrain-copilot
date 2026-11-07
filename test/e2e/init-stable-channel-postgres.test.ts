@@ -1,7 +1,7 @@
 /**
  * GBRA-346, Postgres side of test/init-stable-channel.test.ts: a fresh
  * `gbrain init --url` on an empty content database persists
- * `self_upgrade.channel: stable`, and a re-init of a brain whose config never
+ * `self_upgrade.channel: alpha`, and a re-init of a brain whose config never
  * chose a channel leaves it unset.
  *
  * Runs against a scratch database created from DATABASE_URL so the shared E2E
@@ -58,10 +58,10 @@ describeE2E('init on Postgres: release channel for new installs (GBRA-346)', () 
     if (home) rmSync(home, { recursive: true, force: true });
   });
 
-  test('a fresh install persists self_upgrade.channel = stable', () => {
+  test('a fresh install persists self_upgrade.channel = alpha', () => {
     const r = runInit(home, scratchUrl);
     expect(r.exitCode, r.stderr).toBe(0);
-    expect(JSON.parse(readFileSync(configFile(), 'utf-8')).self_upgrade).toMatchObject({ mode: 'notify', mode_prompted: true, channel: 'stable' });
+    expect(JSON.parse(readFileSync(configFile(), 'utf-8')).self_upgrade).toMatchObject({ mode: 'notify', mode_prompted: true, channel: 'alpha' });
   }, 180_000);
 
   test('re-init of an existing brain that never chose a channel leaves the channel unset', () => {

@@ -16,6 +16,8 @@
 import { closeSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
 import type { Action } from './agent-output.ts';
+import { INSTALL_PIN } from './install-ref.ts';
+import { ACCEPTED_REPO_SLUGS, GITHUB_REPO } from './repo-coordinates.ts';
 
 export type GbrainBinaryKind = 'real' | 'foreign' | 'broken' | 'unknown';
 
@@ -55,11 +57,8 @@ export interface ClassifyGbrainBinaryOptions {
   realpath?: (path: string) => string;
 }
 
-/** Repository marker identifying this project's package.json. */
-const REAL_REPO_MARKER = 'garrytan/gbrain';
-
-/** The documented install command (the `stable` release ref). */
-const INSTALL_ARGV = ['bun', 'install', '-g', `github:${REAL_REPO_MARKER}#stable`];
+/** The documented install command (INSTALL_PIN, the one install ref in core/install-ref.ts). */
+const INSTALL_ARGV = ['bun', 'install', '-g', INSTALL_PIN];
 
 /** #218 recovery: a Bun global install can skip the postinstall that applies schema migrations. */
 const SCHEMA_RECOVERY_ARGV = ['gbrain', 'apply-migrations', '--yes', '--no-autopilot-install'];
@@ -68,7 +67,7 @@ const SCHEMA_RECOVERY_ARGV = ['gbrain', 'apply-migrations', '--yes', '--no-autop
 export const NPM_SQUAT_REMEDIATION =
   `Remove the unrelated package (\`bun remove -g gbrain\` or \`npm uninstall -g gbrain\`) ` +
   `and install/upgrade only via the documented path: \`${INSTALL_ARGV.join(' ')}\` ` +
-  `(or \`git clone https://github.com/${REAL_REPO_MARKER}.git && bun install && bun link\`). ` +
+  `(or \`git clone https://github.com/${GITHUB_REPO}.git && bun install && bun link\`). ` +
   `If the schema is then behind (#218), run \`${SCHEMA_RECOVERY_ARGV.join(' ')}\`.`;
 
 /**
@@ -115,14 +114,14 @@ function nearestPackageJson(start: string): { dir: string; pkg: Record<string, a
 
 /**
  * Is this package.json THIS project? Two markers, either suffices:
- *  - repository field pointing at garrytan/gbrain (string or { url }), or
+ *  - repository field pointing at an accepted project repo (string or { url }), or
  *  - this repo's known bin shape (`"bin": { "gbrain": "src/cli.ts" }` — a
  *    git checkout / `bun install -g github:...` install carries it verbatim;
  *    a registry-published package ships built JS, not a bare .ts bin).
  */
 function isRealGbrainPackage(pkg: Record<string, any>): boolean {
   const repo = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url;
-  if (typeof repo === 'string' && repo.includes(REAL_REPO_MARKER)) return true;
+  if (typeof repo === 'string' && ACCEPTED_REPO_SLUGS.some(slug => repo.includes(slug))) return true;
   if (pkg.bin && typeof pkg.bin === 'object' && pkg.bin.gbrain === 'src/cli.ts') return true;
   return false;
 }

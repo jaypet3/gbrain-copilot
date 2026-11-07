@@ -125,10 +125,11 @@ docs/scripts, not GitHub API or clone URLs in `src/`.
 **New upstream workflows** arrive with Ubicloud runners and schedules; apply the
 same CI deltas as above (runners, `main`, schedules removed) to each new file.
 
-**Distribution tags** — the fork publishes no `stable` / `latest-stable` tags, so
-the stable-channel update check stays quiet and `#latest-stable` install pins in
-fork docs resolve only once a tag exists. Keep the fork's install pins rather than
-adopting upstream's `garrytan/gbrain#stable` lines.
+**Distribution tags** — until the fork publishes its own stable tag and evidence
+record, install from `main` and default to alpha, whose update check reads the
+fork's `main` version. Explicit stable requests fail closed; never substitute
+upstream evidence or silently fall back. Keep the fork's install pins rather
+than adopting upstream's stable pin.
 
 **Everything else** — merge on the merits. Upstream's `src/` fixes and new tests
 are the whole point of tracking upstream.

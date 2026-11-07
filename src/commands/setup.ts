@@ -36,6 +36,7 @@ import { hostedOptionMuted, hostedOptionNotice, writeHostedOption } from '../cor
 import { writeJsonDocument } from '../core/cli-force-exit.ts';
 import { configDir, gbrainPath, isThinClient, loadConfig, type GBrainConfig } from '../core/config.ts';
 import { resolveGbrainBin } from '../core/gbrain-bin.ts';
+import { INSTALL_PIN } from '../core/install-ref.ts';
 import { isRegistrationSurface, isValidName, REGISTRATION_SURFACE, registrationAdvertise, stdioServeArgv } from '../core/mcp-registration.ts';
 import { hookLauncherPath } from '../core/setup/hook-launcher.ts';
 import { isValidSourceId } from '../core/source-id.ts';
@@ -394,7 +395,7 @@ export async function runSetup(args: string[]): Promise<number> {
 
   const launcher = flags.gbrainBin ?? resolveGbrainBin();
   if (!launcher || !launcher.startsWith('/')) {
-    process.stderr.write('gbrain setup: cannot resolve an absolute gbrain launcher (GUI hosts inherit no PATH). Install gbrain globally (`bun install -g github:garrytan/gbrain`) or pass --gbrain-bin <absolute path>.\n');
+    process.stderr.write(`gbrain setup: cannot resolve an absolute gbrain launcher (GUI hosts inherit no PATH). Install gbrain globally (\`bun install -g ${INSTALL_PIN}\`) or pass --gbrain-bin <absolute path>.\n`);
     return 2;
   }
 

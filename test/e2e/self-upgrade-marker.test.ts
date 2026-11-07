@@ -21,6 +21,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VERSION } from '../../src/version.ts';
+import { writeChannelCache } from '../helpers/update-cache.ts';
 
 let home: string;
 let gbrainDir: string;
@@ -37,7 +38,7 @@ afterEach(() => {
 });
 
 function writeCache(line: string): void {
-  writeFileSync(join(gbrainDir, 'last-update-check'), line + '\n'); // mtime = now → fresh
+  writeChannelCache(gbrainDir, line, { channel: 'alpha' }); // checked_at = now → fresh; alpha is the default channel
 }
 
 function runGbrain(mode: string | undefined): { stdout: string; stderr: string; code: number } {
@@ -106,10 +107,19 @@ describe('self-upgrade marker on a real invocation', () => {
 
   test('active snooze for the version → no marker (notify mode honors snooze)', () => {
     writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
-    // snooze record: "<version> <level> <epoch-ms>" — fresh ts so it's active.
-    writeFileSync(join(gbrainDir, 'update-snoozed'), `0.99.0 1 ${Date.now()}\n`);
+    const now = Date.now();
+    writeFileSync(join(gbrainDir, 'update-snoozed.alpha.json'), JSON.stringify({ version: '0.99.0', level: 1, ts: now, until: now + 86_400_000 }) + '\n');
     const { stderr } = runGbrain('notify');
     expect(stderr).not.toContain('UPGRADE_AVAILABLE');
+  });
+
+  test('GBRA-224: a legacy unpartitioned cache is never read, and the fork does not claim a stable-default switch', () => {
+    writeFileSync(join(gbrainDir, 'last-update-check'), `UPGRADE_AVAILABLE ${VERSION} 0.99.0\n`);
+    writeChannelCache(gbrainDir, `UP_TO_DATE ${VERSION}`, { channel: 'alpha' });
+    const first = runGbrain('notify').stderr;
+    expect(first).not.toContain('UPGRADE_AVAILABLE');
+    expect(first).not.toContain('[gbrain notice release_channel]');
+    expect(runGbrain('notify').stderr).not.toContain('[gbrain notice release_channel]');
   });
 
   test('JUST_UPGRADED breadcrumb → one-time confirmation on stderr, then cleared', () => {

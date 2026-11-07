@@ -37,7 +37,7 @@ here using the actual harness adapter.
 Install Bun if needed, then the canonical GBrain distribution:
 
 ```bash
-bun install -g github:jaypetez/gbrain-copilot#latest-stable
+bun install -g github:jaypetez/gbrain-copilot#main
 gbrain engine status --json
 ```
 

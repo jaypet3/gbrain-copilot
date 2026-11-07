@@ -73,7 +73,7 @@ For other local installations, resolve conflicting routing before following
 the canonical distribution and keyless initialization:
 
 ```bash
-bun install -g github:jaypetez/gbrain-copilot#latest-stable
+bun install -g github:jaypetez/gbrain-copilot#main
 gbrain init --pglite --no-embedding
 ```
 

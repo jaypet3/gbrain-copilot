@@ -58,7 +58,7 @@ If you fetched this file by URL without cloning yet, the companion files live at
 > package named `gbrain` is an unrelated package. Do NOT run `npm install -g gbrain` or
 > `bun add -g gbrain` (note the missing `github:` prefix — that's the trap). The only
 > supported sources are `github:jaypetez/gbrain-copilot` (optionally pinned as
-> `github:jaypetez/gbrain-copilot#latest-stable`, the form the bootstrap flow mandates) and a
+> `github:jaypetez/gbrain-copilot#main`, the form the bootstrap flow uses) and a
 > git clone, exactly as shown below.
 > If an unrelated npm install is already present, remove it first
 > (`npm uninstall -g gbrain` / `bun remove -g gbrain`); `gbrain doctor` also detects this.
@@ -813,8 +813,8 @@ autopilot (`gbrain autopilot pause`), wait until no job is active, run
 `gbrain upgrade` on every install (it restarts every gbrain process onto the
 new build and verifies one build runs, or refuses `restart_refused` naming the
 process it cannot restart), check that each process reports the new version,
-then `gbrain autopilot resume`. A production brain follows the stable channel
-(`gbrain config set self_upgrade.channel stable`)
+then `gbrain autopilot resume`. Installs follow the fork's alpha channel by
+default; stable requires the fork's own promotion evidence
 ([the order](skills/gbrain-upgrade/SKILL.md#always-on-hosts-pause-drain-upgrade-verify-resume),
 [stable channel](docs/guides/upgrades-auto-update.md#stable-channel)).
 

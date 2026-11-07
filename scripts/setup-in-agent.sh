@@ -46,6 +46,7 @@ done
 # The runtime pin follows the repository's supported CI release. Repair reads
 # its prior version from the non-secret receipt; no mutable latest runtime URL.
 gbrain_bun_version=1.4.4
+gbrain_install_ref=main
 gbrain_source_ref=''
 if [[ -f "$gbrain_receipt" && "$gbrain_upgrade" == 0 ]]; then
   gbrain_prior_bun=$(sed -n 's/.*"bun_version": *"\([0-9.]*\)".*/\1/p' "$gbrain_receipt" | head -1)
@@ -54,10 +55,15 @@ if [[ -f "$gbrain_receipt" && "$gbrain_upgrade" == 0 ]]; then
 fi
 [[ "$gbrain_bun_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid recorded Bun version; preserve the receipt and repair it.' >&2; exit 1; }
 if [[ -z "$gbrain_source_ref" ]]; then
-  # Resolve the stable tag once; the installed receipt records this immutable
+  # Resolve the branch or tag once; the installed receipt records this immutable
   # commit, so an ordinary repair never upgrades the software implicitly.
-  gbrain_refs=$(git ls-remote https://github.com/garrytan/gbrain.git 'refs/tags/stable' 'refs/tags/stable^{}')
-  gbrain_source_ref=$(printf '%s\n' "$gbrain_refs" | awk '/\^\{\}$/ {print $1; found=1} END {if (!found) exit 1}') || gbrain_source_ref=$(printf '%s\n' "$gbrain_refs" | awk 'NR==1 {print $1}')
+  gbrain_refs=$(git ls-remote https://github.com/jaypetez/gbrain-copilot.git "refs/heads/$gbrain_install_ref" "refs/tags/$gbrain_install_ref" "refs/tags/$gbrain_install_ref^{}")
+  gbrain_source_ref=$(printf '%s\n' "$gbrain_refs" | awk -v ref="$gbrain_install_ref" '
+    $2 == "refs/tags/" ref "^{}" { peeled = $1 }
+    $2 == "refs/tags/" ref { tag = $1 }
+    $2 == "refs/heads/" ref { branch = $1 }
+    END { print branch ? branch : peeled ? peeled : tag }
+  ')
 fi
 [[ "$gbrain_source_ref" =~ ^[a-f0-9]{40}$ ]] || { echo 'Could not resolve the GBrain package commit.' >&2; exit 1; }
 
@@ -96,7 +102,7 @@ for gbrain_env_name in $(compgen -e); do
 done
 export GBRAIN_HOME="$gbrain_work/setup-home" GBRAIN_SKIP_STARTUP_HOOKS=1
 export BUN_INSTALL_CACHE_DIR="$gbrain_work/cache"
-printf '{"private":true,"dependencies":{"gbrain":"github:garrytan/gbrain#%s"}}\n' "$gbrain_source_ref" > "$gbrain_work/bundle/app/package.json"
+printf '{"private":true,"dependencies":{"gbrain":"github:jaypetez/gbrain-copilot#%s"}}\n' "$gbrain_source_ref" > "$gbrain_work/bundle/app/package.json"
 "$gbrain_work/bundle/bun" install --cwd "$gbrain_work/bundle/app" --ignore-scripts >&2
 "$gbrain_work/bundle/bun" --no-env-file "$gbrain_work/bundle/app/node_modules/gbrain/src/core/agent-install/entry.ts" \
   --root "$gbrain_root" --harness "$gbrain_harness" --bundle "$gbrain_work/bundle" --source-ref "$gbrain_source_ref" "${gbrain_extra[@]}"

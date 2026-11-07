@@ -10,23 +10,72 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
-## [0.60.605.1] - 2026-11-07
+## [0.60.607.1] - 2026-11-07
 
-**Caught this fork up with upstream again. Everything from [garrytan/gbrain](https://github.com/garrytan/gbrain) through v0.60.605.0 is now merged in.**
+**Caught this fork up with upstream again. Everything from [garrytan/gbrain](https://github.com/garrytan/gbrain) through v0.60.607.0 is now merged in.**
 
 This is a maintenance release: no new fork-specific features. The upstream backlog since v0.60.258.0 is folded in and re-verified against the Copilot packaging. See the upstream entries below for what changed in the engine, CLI, skills, and docs.
 
 ### Merge notes
 - Fork identity (Copilot manifests, install scripts, `src/core/repo-coordinates.ts`, README/COPILOT docs) was kept through the merge. New upstream call sites that fetch from GitHub (the stable-channel check, the agent-install setup helper, the post-upgrade restart hint) now read the fork coordinates too.
-- Upstream added a soak-gated `stable` channel. This fork publishes no `stable` tag, so the stable check finds nothing to compare and stays quiet; the latest channel keeps following the fork's `main` branch.
+- Upstream added an evidence-gated `stable` channel. This fork does not yet publish its stable tag or evidence record, so it continues to install from and follow its `main` branch by default. An explicit stable check reports the missing promotion without falling back.
 - New upstream workflows (production soak, daily stable promotion, sync-freshness gate, TLA spec) run on GitHub-hosted runners with their schedules removed; run them by hand from the Actions tab.
 - Upstream's PR workflow now runs a cheap test tier on pull requests and the full suite on push, merge queue, manual dispatch, or a `full-ci` label.
 
-### To take advantage of v0.60.605.1
+### To take advantage of v0.60.607.1
 
 Existing brains: `gbrain upgrade`. Migrations apply automatically. Bun 1.4.4 or newer is required (`bun upgrade`).
 
 Copilot CLI users: no reinstall needed; `gbrain upgrade` pulls this release from the fork.
+
+## [0.60.607.0] - 2026-11-07
+
+**A long `gbrain sync` no longer prints a stall right after the writer was busy finishing a claimed request.**
+
+While a sync drains its write queue, gbrain prints a live line such as `stalled 45s on queued` when the request at the head of the queue stops moving. If the head was claimed for a while (for example while the process published the writes a killed server left behind) and a new queued request then reached the head, that line counted the new request's wait from before the claimed stretch. It reported a stall of a minute or more right after the writer had been working the whole time. Now every read of the head counts as progress, claimed or not, so the next queued head's age starts at the read before it. A claimed head still prints its own step age.
+
+### What you'd see
+
+| Head reads, ten seconds apart | Before | Now |
+|---|---|---|
+| a queued request, then a claimed one for 60 seconds, then a new queued request | `stalled 70s on queued` | `stalled 10s on queued` |
+| a claimed request that is publishing | the claim's step age | the claim's step age (unchanged) |
+
+### Things to watch
+
+Only the printed age changes. When a sync stops, escalates or reports blocked is unchanged, and nothing stored is touched.
+
+### Itemized changes
+
+#### Fixed
+
+- The in-pass stall line (`inPassHeadAge` in `src/core/persistence/sync-drain.ts`) records claimed head reads, so a queued head that follows a claimed one counts its age from the read before it.
+
+#### For contributors
+
+- `test/sync-drain-claims.test.ts` covers a claimed head between two queued heads. The convergence nightly's 70 s owner-kill stall bound now measures real stalls, not time the writer spent publishing a killed server's writes.
+
+## [0.60.606.0] - 2026-11-07
+
+**Updates follow a stable channel by default; every release is one setting away on alpha.**
+
+gbrain publishes a release for nearly every merged change, more than a hundred a week. Every install followed all of them, so an always-on brain upgraded several times a week onto releases no one had run on a production-shaped brain. Installs now follow the stable channel, which gets about one release a week, each promoted by a maintainer after the soak passed on that release's exact tree. The alpha channel (the old `latest`, which still works as an alias) keeps every release.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A new or existing install with no channel set | offered every published release | offered the newest stable release; one notice on stderr says so, once per brain home |
+| Following every release | the default | `gbrain config set self_upgrade.channel alpha` (or `--channel alpha`, `GBRAIN_RELEASE_CHANNEL=alpha`) |
+| Which stable release is offered | `VERSION` at the `stable` tag | the published evidence record (`stable.json` on `stable-record`): version, commit, tree, soak run, withdrawn versions; a record without the evidence is never trusted |
+| Stable has no usable answer | `stable_channel_unresolved` on upgrade | `stable_missing`, `stable_invalid` or `stable_unreadable`; the background check only reports it, an explicit upgrade exits non-zero, neither falls back to alpha |
+| An install ahead of stable (it ran alpha) | — | offered nothing until stable passes it; never downgraded unless its version was withdrawn |
+| Update cache and snooze | one file for every channel; a snooze ended when a newer release shipped | one per channel, tagged with the evidence policy; a snooze holds its whole window (24 h, 48 h, 7 days); a stable rollback below it clears it |
+| `gbrain upgrade --dry-run` | refused without `--restart-only` | reports channel, its source, current and target version and the action, installing nothing |
+| doctor `self_upgrade_health` | — | names the channel and its source, warns on an invalid channel or a failed stable check |
+| `Promote stable` workflow | moved the `stable` tag | also commits the evidence record in the same atomic push; new `withdraw` input adds versions to `known_bad`; promoting the current stable again writes its record from the stable tag's message, moving no tag (the one-time backfill for releases promoted before the record existed; the daily stable check does it on its first scheduled run) |
+
+Install commands now name `stable` (`bun install -g github:garrytan/gbrain#stable`), so a new install starts on the channel it follows. Every install surface goes through one constant (`src/core/install-ref.ts`), checked by `bun run check:install-ref`; `latest-stable` still installs the newest release for anyone who pins it.
 
 ## [0.60.605.0] - 2026-11-07
 

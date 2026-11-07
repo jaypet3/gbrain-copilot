@@ -66,7 +66,7 @@ Do nothing. The operator disabled update checks.
 ### mode = auto
 First check the playbooks between the installed and the new version: list
 `skills/migrations/` (in the gbrain install, or
-[the published directory](https://github.com/garrytan/gbrain/tree/master/skills/migrations))
+[the published directory](https://github.com/jaypetez/gbrain-copilot/tree/main/skills/migrations))
 for every `v<version>.md` newer than `<old>` and up to `<new>`, and read each
 one's first steps. If any says not to upgrade unattended, or describes an
 attended cutover (stop writers, back up, install one version everywhere), do
@@ -113,7 +113,8 @@ If `changelog_diff` is empty (network blip / no notes), ask without the bullets
 rather than blocking — the version numbers alone are enough to decide.
 
 - **Yes** → `gbrain self-upgrade`
-- **Always** → `gbrain config set self_upgrade.mode auto` then `gbrain self-upgrade`
+- **Always** → `gbrain config set self_upgrade.mode auto` then `gbrain self-upgrade`;
+  tell the user it applies updates from their configured release channel (alpha by default in this fork)
 - **Not now** → do nothing; the snooze escalates (24h → 48h → 7d) and the marker
   stops nagging for this version until it expires or a newer version ships.
 - **Never** → `gbrain config set self_upgrade.mode off`
@@ -122,9 +123,9 @@ rather than blocking — the version numbers alone are enough to decide.
 
 A host that runs autopilot, a jobs worker or a serve must end the upgrade with
 every process on the new build, and a job that starts mid-swap can run half on
-each. A large or production brain follows the stable channel
-(`gbrain config set self_upgrade.channel stable`, or `gbrain upgrade --channel stable`
-once), which offers only releases that passed the production-shaped soak.
+each. Installs follow the fork's alpha channel by default. Stable requires the
+fork's own promotion evidence and tag; until those exist it refuses rather than
+falling back to alpha.
 With the operator's go-ahead, upgrade in this order:
 
 1. `gbrain autopilot pause --reason "upgrade"` so no new cycle starts.

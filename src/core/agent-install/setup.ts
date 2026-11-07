@@ -17,9 +17,9 @@ import {
 } from './state.ts';
 import { bunSpawn, bunSpawnSync } from '../spawn.ts';
 import { MINIMUM_BUN_VERSION, bunVersionMeets } from '../runtime-version.ts';
-import { RAW_BASE_URL } from '../repo-coordinates.ts';
+import { INSTALL_RAW_BASE } from '../install-ref.ts';
 
-const SETUP_HELPER_URL = `${RAW_BASE_URL}/scripts/setup-in-agent.sh`;
+const SETUP_HELPER_URL = `${INSTALL_RAW_BASE}/scripts/setup-in-agent.sh`;
 
 export interface AgentSetupOptions {
   root: string;

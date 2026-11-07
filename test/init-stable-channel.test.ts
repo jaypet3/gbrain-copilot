@@ -1,10 +1,6 @@
 /**
- * GBRA-346: new installs follow the stable channel. A fresh `gbrain init`
- * persists `self_upgrade.channel: stable`, so the update check, `gbrain
- * upgrade` and the autopilot channel offer only releases promoted after the
- * production soak. An existing brain that never chose a channel keeps its
- * config untouched on re-init (its move to stable comes with a one-time notice,
- * not silently), and an explicit channel always wins.
+ * GBRA-346: a fresh `gbrain init` persists this distribution's default
+ * release channel. Re-init preserves an unset or explicitly chosen channel.
  *
  * Subprocess-driven with a hermetic per-test GBRAIN_HOME, same pattern as
  * test/init-force-engine-preservation.test.ts.
@@ -50,12 +46,12 @@ function makeHome(): { home: string; cwd: string; config: () => any; write: (c: 
 }
 
 describe('init: release channel for new installs (GBRA-346)', () => {
-  test('a fresh install persists self_upgrade.channel = stable', async () => {
+  test('a fresh install persists self_upgrade.channel = alpha', async () => {
     const h = makeHome();
     try {
       const r = await runInit(h.home, h.cwd);
       expect(r.exitCode, r.stderr).toBe(0);
-      expect(h.config().self_upgrade).toMatchObject({ mode: 'notify', mode_prompted: true, channel: 'stable' });
+      expect(h.config().self_upgrade).toMatchObject({ mode: 'notify', mode_prompted: true, channel: 'alpha' });
     } finally {
       h.cleanup();
     }

@@ -185,6 +185,29 @@ Release summary line.
 });
 
 describe('release.yml publish-template skip is visible (D-10)', () => {
+  test('an unset template destination skips even when a PAT is present', async () => {
+    const { load } = await import('js-yaml');
+    const wf = load(WORKFLOW) as { jobs: Record<string, { env: Record<string, string>; steps: Array<{ id?: string; run?: string }> }> };
+    const job = wf.jobs['publish-template']!;
+    expect(job.env.TEMPLATE_REPO).toBe('${{ vars.TEMPLATE_REPO }}');
+    const gate = job.steps.find(s => s.id === 'gate')!.run!;
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-publish-template-gate-'));
+    try {
+      const output = join(dir, 'output');
+      const summary = join(dir, 'summary');
+      writeFileSync(output, '');
+      const stdout = execFileSync('bash', ['-euo', 'pipefail', '-c', gate], {
+        cwd: ROOT, encoding: 'utf8',
+        env: { PATH: process.env.PATH, TEMPLATE_REPO_PAT: 'test-token', TEMPLATE_REPO: '', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+      });
+      expect(readFileSync(output, 'utf8')).toContain('publish=false');
+      expect(stdout).toContain('TEMPLATE_REPO repository variable');
+      expect(readFileSync(summary, 'utf8')).toContain('TEMPLATE_REPO is unset');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('an empty TEMPLATE_REPO_PAT warns with the owner-only fix and writes a step summary', async () => {
     const { load } = await import('js-yaml');
     const wf = load(WORKFLOW) as { jobs: Record<string, { steps: Array<{ id?: string; run?: string }> }> };

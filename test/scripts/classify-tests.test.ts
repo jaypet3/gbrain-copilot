@@ -148,6 +148,10 @@ describe('classify-tests detectors', () => {
 describe('structural-suites manifest', () => {
   test('scripts/structural-suites.tsv matches a fresh classification of the test tree', () => {
     const committed = readFileSync(join(import.meta.dir, '..', '..', 'scripts', 'structural-suites.tsv'), 'utf-8');
-    expect(committed).toBe(generate().tsv);
+    const result = generate();
+    expect(result.tsv.includes('test/scripts/classify-tests.test.ts\t')).toBe(true);
+    expect(result.tsv.split('\n').every((line) => !line.startsWith('test\\'))).toBe(true);
+    expect(result.unknown.every((file) => !file.includes('\\'))).toBe(true);
+    expect(committed).toBe(result.tsv);
   }, 60_000);
 });

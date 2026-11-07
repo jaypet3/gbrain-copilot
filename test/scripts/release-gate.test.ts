@@ -1,10 +1,10 @@
 /**
  * scripts/release-gate.ts + release.yml wiring: publication and the
- * latest-stable move wait for Test and E2E Tests success on the release
+ * latest-stable move wait for Test success on the release
  * commit; a failed run publishes nothing with the next step; a run cancelled
- * by a newer push is followed to the next master commit with the same
+ * by a newer push is followed to the next main commit with the same
  * VERSION (or marks the version superseded); dispatch backfills through the
- * same gate; non-master refs are refused.
+ * same gate; non-main refs are refused.
  */
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
@@ -32,10 +32,13 @@ function deps(runs: Record<string, GateRun[]>, versions: Record<string, string> 
 }
 
 describe('release gate', () => {
-  test('publishes the release commit only when Test and E2E Tests both succeeded on it', async () => {
+  test('publishes the release commit only when Test succeeded on it', async () => {
     expect(GATED.map(g => g.file)).toEqual(['test.yml']); // fork: E2E is dispatch-only, only Test gates a release
-    const green = deps({ 'test.yml': [run(1, 10, A, 'completed', 'success')], 'e2e.yml': [run(2, 20, A, 'completed', 'success')] });
-    expect(await evaluate(green, A, '0.60.70.0')).toMatchObject({ kind: 'publish', sha: A });
+    const green = deps({ 'test.yml': [run(1, 10, A, 'completed', 'success')] });
+    const result = await evaluate(green, A, '0.60.70.0');
+    expect(result).toMatchObject({ kind: 'publish', sha: A });
+    expect(result.why).toContain('Test succeeded');
+    expect(result.why).not.toContain('E2E');
     const pending = deps({ 'test.yml': [run(1, 10, A, 'in_progress', null)], 'e2e.yml': [run(2, 20, A, 'completed', 'success')] });
     expect(await evaluate(pending, A, '0.60.70.0')).toMatchObject({ kind: 'wait' });
     const missing = deps({ 'e2e.yml': [run(2, 20, A, 'completed', 'success')] });
@@ -48,13 +51,13 @@ describe('release gate', () => {
     expect(v.kind).toBe('fail');
     if (v.kind !== 'fail') return;
     expect(v.why).toContain('v0.60.70.0 is not published and latest-stable does not move');
-    expect(v.next).toContain('Master red: Test');
-    expect(v.next).toContain('gh workflow run release.yml --ref master');
+    expect(v.next).toContain('Repair main CI');
+    expect(v.next).toContain('gh workflow run release.yml --ref main');
     const rerunGreen = deps({ 'test.yml': [run(1, 10, A, 'completed', 'failure'), run(1, 10, A, 'completed', 'success', 2)], 'e2e.yml': [run(2, 20, A, 'completed', 'success')] });
     expect((await evaluate(rerunGreen, A, '0.60.70.0')).kind).toBe('publish');
   });
 
-  test('a run cancelled by a newer push is followed to the next master commit with the same VERSION, which is published', async () => {
+  test('a run cancelled by a newer push is followed to the next main commit with the same VERSION, which is published', async () => {
     const d = deps({
       'test.yml': [run(1, 10, A, 'completed', 'cancelled'), run(3, 11, B, 'completed', 'success')],
       'e2e.yml': [run(2, 20, A, 'completed', 'success'), run(4, 21, B, 'completed', 'success')],
@@ -63,7 +66,7 @@ describe('release gate', () => {
     expect(v).toMatchObject({ kind: 'publish', sha: B });
     expect(v.why).toContain('same VERSION');
     const notYet = deps({ 'test.yml': [run(1, 10, A, 'completed', 'cancelled')], 'e2e.yml': [run(2, 20, A, 'completed', 'success')] });
-    expect((await evaluate(notYet, A, '0.60.70.0')).why).toContain('waiting for the newer push-to-master run');
+    expect((await evaluate(notYet, A, '0.60.70.0')).why).toContain('waiting for the newer push-to-main run');
     const redSuccessor = deps({ 'test.yml': [run(1, 10, A, 'completed', 'cancelled'), run(3, 11, B, 'completed', 'failure')], 'e2e.yml': [run(4, 21, B, 'completed', 'success')] });
     expect(await evaluate(redSuccessor, A, '0.60.70.0')).toMatchObject({ kind: 'fail', sha: B });
   });
@@ -75,26 +78,25 @@ describe('release gate', () => {
     expect((await evaluate(stray, A, '0.60.70.0')).kind).toBe('fail');
   });
 
-  test('a publish names the full-suite run each workflow reused, and writes both ids', async () => {
+  test('a publish names the full-suite run Test reused and writes its id', async () => {
     const d = deps({ 'test.yml': [run(1, 10, A, 'completed', 'success')], 'e2e.yml': [run(2, 20, A, 'completed', 'success')] }, {}, [], { 1: { reused: true, run_id: 900, run_attempt: 2, sha: B } });
     const v = await evaluate(d, A, '0.60.70.0');
-    expect(v).toMatchObject({ kind: 'publish', sha: A, sources: [{ workflow: 'Test', run_id: 1, reused: { run_id: 900, run_attempt: 2, sha: B } }, { workflow: 'E2E Tests', run_id: 2 }] });
+    expect(v).toMatchObject({ kind: 'publish', sha: A, sources: [{ workflow: 'Test', run_id: 1, reused: { run_id: 900, run_attempt: 2, sha: B } }] });
     expect(v.why).toContain('Test reused full-suite run 900 attempt 2');
-    expect(v.why).toContain('E2E Tests ran in full in run 2');
     if (v.kind !== 'publish') return;
-    expect(reuseOutputs(v.sources)).toBe('test_reused_run_id=900\ne2e_reused_run_id=\n');
+    expect(reuseOutputs(v.sources)).toBe('test_reused_run_id=900\n');
   });
 
   test('a reused push run whose reuse record cannot be read publishes nothing and names the re-run', async () => {
-    const d = deps({ 'test.yml': [run(1, 10, A, 'completed', 'success')], 'e2e.yml': [run(2, 20, A, 'completed', 'success')] }, {}, [], { 2: { problem: "run 2 has no 'reused-full-suite' artifact" } });
+    const d = deps({ 'test.yml': [run(1, 10, A, 'completed', 'success')] }, {}, [], { 1: { problem: "run 1 has no 'reused-full-suite' artifact" } });
     const v = await evaluate(d, A, '0.60.70.0');
     expect(v.kind).toBe('fail');
     if (v.kind !== 'fail') return;
-    expect(v.why).toContain('E2E Tests run 2');
+    expect(v.why).toContain('Test run 1');
     expect(v.why).toContain("no 'reused-full-suite' artifact");
     expect(v.why).toContain('v0.60.70.0 is not published');
-    expect(v.next).toContain('gh run rerun 2');
-    expect(v.next).toContain('gh workflow run release.yml --ref master');
+    expect(v.next).toContain('gh run rerun 1');
+    expect(v.next).toContain('gh workflow run release.yml --ref main');
   });
 
   test('the poller waits while CI runs and fails with the backfill command at its deadline (dispatch backfill uses the same gate)', async () => {
@@ -114,7 +116,7 @@ describe('release gate', () => {
     t = 0;
     const late = await gate(stuck, { sha: A, version: '0.60.70.0', timeoutMs: 3 * 60_000, pollMs: 60_000, log: () => {}, sleep: async ms => { t += ms; }, now: () => t });
     expect(late.kind).toBe('fail');
-    if (late.kind === 'fail') expect(late.next).toContain('gh workflow run release.yml --ref master');
+    if (late.kind === 'fail') expect(late.next).toContain('gh workflow run release.yml --ref main');
   });
 });
 
@@ -166,7 +168,7 @@ describe('release gate reads reuse provenance from the push run', () => {
     const otherPush = await apiDeps(client([{ name: 'reused-full-suite', conclusion: 'success' }], { ...rec, push_sha: B })).provenance('test.yml', pushRun);
     expect('problem' in otherPush && otherPush.problem).toContain('not ' + A);
     const otherWorkflow = await apiDeps(client([{ name: 'reused-full-suite', conclusion: 'success' }], rec)).provenance('e2e.yml', pushRun);
-    expect('problem' in otherWorkflow && otherWorkflow.problem).toContain('not E2E Tests');
+    expect('problem' in otherWorkflow && otherWorkflow.problem).toContain('not e2e.yml');
     const failed = await apiDeps(client([{ name: 'reused-full-suite', conclusion: 'failure' }], rec)).provenance('test.yml', pushRun);
     expect('problem' in failed && failed.problem).toContain('concluded failure');
   });
