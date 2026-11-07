@@ -24,8 +24,9 @@
  * page waits for the user's approval (the oversized-page upgrade backfill, or
  * a sampled junk hit). Held and capped pages leave the stale-chunk queue
  * (engine-sql/chunks.ts staleChunkWhere) so the sweep never retries them; an explicit
- * approval (`gbrain embed --slugs <slug> --max-usd N`, `gbrain embed --held
- * --max-usd N`) passes `approvedCapUsd`, lifts the hold and raises the cap.
+ * approval (`gbrain embed --held --source S --max-usd N`, or `--slugs <slug>
+ * --source S --max-usd N`) passes `approvedCapUsd`, lifts the hold and raises the
+ * cap. Every printed approve and its N come from held-embedding-action.ts.
  *
  * Crash safety: a reservation older than an hour (the provider call never
  * settled) is counted as spent, never released, so a crash cannot reopen
@@ -35,18 +36,27 @@ import type { BrainEngine } from './engine.ts';
 import { JUNK_SAMPLE_CHARS, assessJunkWindows, assessSampledJunk } from './content-sanity.ts';
 import type { BodyStorage, ManifestRow } from './page-body/types.ts';
 import { isSegmentedPage, pageBodyBytes } from './page-body/page-shape.ts';
-import { estimateCostFromChars, lookupEmbeddingPrice } from './embedding-pricing.ts';
-import { PAGE_INLINE_MAX_BYTES, isLargePageBytes } from './page-size-policy.ts';
+import { derivationSweepCoversPage } from './page-body/segment-derive.ts';
+import { estimateCostFromChars } from './embedding-pricing.ts';
+import { reservationCostUsd, usageCostUsd } from './budget/reservation-cost.ts';
+import { BudgetTracker, type PricingOverrides } from './budget/budget-tracker.ts';
+import { getCurrentBudgetTracker, withBudgetTracker } from './ai/gateway.ts';
+import { recordOnTracker } from './ai/budget-record.ts';
+import { RESERVATION_WINDOW_SQL, RESERVED_AT_SQL, reserveDerivationSpend, settleLedgerReservation, type PageSpendDecision, type PageSpendGrant,
+  type PageSpendKind, type PageSpendSignature } from './page-spend.ts';
+import { PAGE_INLINE_MAX_BYTES, budgetRowAppliesFilter, isLargePageBytes } from './page-size-policy.ts';
 import { isEmbedSkipped } from './embed-skip.ts';
 import { parseUsdLimit, resolveSpendPosture } from './spend-posture.ts';
 import { chunkGenerationFilter } from './search/safe-chunks.ts';
 import { quoteIdentifier } from './search/embedding-column.ts';
 import { embeddingWriteTarget } from './page-state/projections.ts';
+import { approvalAmount, approvalBasis, heldApproveAction, heldPreviewCommand, ledgerPricePerMTok, renderedCommand } from './held-embedding-action.ts';
+
+export type { PageSpendDecision, PageSpendGrant, PageSpendKind, PageSpendSignature } from './page-spend.ts';
+export { PAGE_DERIVATION_CAP_KEY } from './page-spend.ts';
 
 export const PAGE_EMBED_CAP_KEY = 'embed.max_usd_per_page';
 export const DEFAULT_PAGE_EMBED_CAP_USD = 2;
-/** Price assumed for a model with no known rate (the conservative OpenAI large rate). */
-const UNPRICED_RATE_PER_MTOK = 0.13;
 
 export type PageBudgetState = 'open' | 'held' | 'capped';
 
@@ -89,7 +99,7 @@ type BudgetPage = { id: number; body_storage?: BodyStorage | null; body_bytes?: 
 async function segmentedSampleWindows(engine: BrainEngine, pageId: number): Promise<string[]> {
   const manifest = await engine.readManifest(pageId);
   if (manifest.length === 0) return [''];
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
   const read = async (row: ManifestRow) => {
     const texts = await engine.readSegmentTexts(row.sourceId, [row.sha256]);
     return decoder.decode(texts.get(Buffer.from(row.sha256).toString('hex')) ?? new Uint8Array());
@@ -104,12 +114,6 @@ async function segmentedSampleWindows(engine: BrainEngine, pageId: number): Prom
   const totalBytes = manifest.reduce((n, row) => n + row.byteLen, 0);
   const middle = manifest.findIndex(row => row.byteStart + row.byteLen > totalBytes / 2);
   return [await forward(0), await forward(Math.max(0, middle)), tail.slice(-JUNK_SAMPLE_CHARS)];
-}
-
-function currentPricePerMTok(signature: string | null | undefined): { rate: number; priced: boolean } {
-  if (!signature) return { rate: UNPRICED_RATE_PER_MTOK, priced: false };
-  const hit = lookupEmbeddingPrice(signature.slice(0, signature.lastIndexOf(':')) || signature);
-  return hit.kind === 'known' ? { rate: hit.pricePerMTok, priced: true } : { rate: UNPRICED_RATE_PER_MTOK, priced: false };
 }
 
 /** Hold a large page's embedding until the user approves it (`reason` names why). Idempotent; never touches open spend. */
@@ -130,11 +134,11 @@ export async function planPageEmbedding(engine: BrainEngine, page: BudgetPage,
   if (!isLargePageBytes(pageBodyBytes(page)) || stale.length === 0) return { kind: 'unmetered' };
   const approved = opts.approvedCapUsd !== undefined;
   const configured = await resolvePageEmbedCapUsd(engine);
-  const { rate, priced } = currentPricePerMTok(opts.signature);
+  const { rate, priced } = ledgerPricePerMTok(opts.signature);
   return engine.transaction(async tx => {
     await tx.executeRaw('INSERT INTO page_embedding_budget (page_id) VALUES ($1) ON CONFLICT (page_id) DO NOTHING', [page.id]);
     const [row] = await tx.executeRaw<BudgetRow>(`SELECT state, reason, embedding_signature, spent_usd, reserved_usd, cap_usd,
-        (reserved_usd > 0 AND reserved_at < now() - interval '1 hour') AS stale_reservation
+        (reserved_usd > 0 AND updated_at < now() - interval '1 hour') AS stale_reservation
       FROM page_embedding_budget WHERE page_id = $1 FOR UPDATE`, [page.id]);
     if (!row) return { kind: 'unmetered' } as const;
     if (row.state === 'held' && !approved) return { kind: 'held', reason: row.reason ?? 'awaiting_approval' } as const;
@@ -163,38 +167,172 @@ export async function planPageEmbedding(engine: BrainEngine, page: BudgetPage,
       chunkIndexes.add(chunk.chunk_index);
     }
     const deferred = stale.length - chunkIndexes.size;
+    const openWindow = reserved > 0;
     reserved += reservedUsd;
     const state: PageBudgetState = deferred > 0 ? 'capped' : 'open';
-    await tx.executeRaw(`UPDATE page_embedding_budget SET state = $2, reason = $3, embedding_signature = COALESCE($4, embedding_signature),
-        spent_usd = $5::float8, reserved_usd = $6::float8, reserved_at = CASE WHEN $6::float8 > 0 THEN now() ELSE NULL END,
-        cap_usd = $7::float8, updated_at = now() WHERE page_id = $1`,
+    const [written] = await tx.executeRaw<{ reservation_window: string | null }>(`UPDATE page_embedding_budget SET state = $2, reason = $3, embedding_signature = COALESCE($4, embedding_signature),
+        spent_usd = $5::float8, reserved_usd = $6::float8, ${RESERVED_AT_SQL('$6::float8', '$8::boolean')},
+        cap_usd = $7::float8, updated_at = now() WHERE page_id = $1 RETURNING ${RESERVATION_WINDOW_SQL} AS reservation_window`,
     [page.id, state, deferred > 0 ? 'cap_reached' : null, opts.signature ?? null, spent, reserved,
-      approved && Number.isFinite(capUsd) ? capUsd : row.cap_usd]);
+      approved && Number.isFinite(capUsd) ? capUsd : row.cap_usd, openWindow]);
     const grant: PageEmbedGrant = {
       chunkIndexes, reservedUsd, deferred, capUsd,
-      settle: async ({ ok }) => {
-        if (reservedUsd === 0) return;
-        await engine.executeRaw(`UPDATE page_embedding_budget SET reserved_usd = GREATEST(0, reserved_usd - $2::float8),
-            spent_usd = spent_usd + $3::float8, unpriced_calls = unpriced_calls + $4::int, updated_at = now() WHERE page_id = $1`,
-        [page.id, reservedUsd, ok ? reservedUsd : 0, ok && !priced ? 1 : 0]);
-      },
+      settle: ({ ok }) => settleLedgerReservation(engine, { table: 'page_embedding_budget', pageId: page.id }, written?.reservation_window ?? null,
+        reservedUsd, ok ? reservedUsd : 0, ok && !priced ? 1 : 0),
     };
     return { kind: 'grant', grant } as const;
   });
 }
 
+/**
+ * Reserve `estimateUsd` of one paid step on `page` against its per-page cap (wave-b spec 8.3), before the provider call.
+ * An embedding reserves on page_embedding_budget under `embed.max_usd_per_page` (a new embedding model starts a new
+ * ledger, as planPageEmbedding does); a derivation (facts, synopsis) on its own family's ledger (page-spend.ts).
+ * Metered: segmented pages and pages over `pages.inline_max_bytes`; any other page is unmetered. A refusal reserves
+ * nothing, so the caller skips the call. A derivation runs its call through meterPaidCall, which books the actual cost.
+ */
+export async function reservePageSpend(engine: BrainEngine, page: BudgetPage, signature: PageSpendSignature, estimateUsd: number): Promise<PageSpendDecision> {
+  if (!isSegmentedPage(page) && !isLargePageBytes(pageBodyBytes(page))) return { kind: 'unmetered' };
+  const split = signature.indexOf(':');
+  const kind = signature.slice(0, split) as PageSpendKind;
+  if (kind !== 'embedding') return reserveDerivationSpend(engine, page.id, kind, estimateUsd);
+  const embeddingSignature = signature.slice(split + 1);
+  const configured = await resolvePageEmbedCapUsd(engine);
+  const estimate = Math.max(0, estimateUsd);
+  return engine.transaction(async tx => {
+    await tx.executeRaw('INSERT INTO page_embedding_budget (page_id) VALUES ($1) ON CONFLICT (page_id) DO NOTHING', [page.id]);
+    const [row] = await tx.executeRaw<BudgetRow>(`SELECT state, reason, embedding_signature, spent_usd, reserved_usd, cap_usd,
+        (reserved_usd > 0 AND updated_at < now() - interval '1 hour') AS stale_reservation
+      FROM page_embedding_budget WHERE page_id = $1 FOR UPDATE`, [page.id]);
+    if (!row) return { kind: 'unmetered' } as const;
+    const sameLedger = !row.embedding_signature || row.embedding_signature === embeddingSignature;
+    const spent = sameLedger ? Number(row.spent_usd) + (row.stale_reservation ? Number(row.reserved_usd) : 0) : 0;
+    const reserved = sameLedger && !row.stale_reservation ? Number(row.reserved_usd) : 0;
+    const capUsd = row.cap_usd === null ? configured : Number(row.cap_usd);
+    const refused = (reason: 'cap_reached' | 'held') => ({ kind: 'refused', reason, capUsd, spentUsd: spent, reservedUsd: reserved, estimateUsd: estimate } as const);
+    if (row.state === 'held') return refused('held');
+    if (spent + reserved + estimate > capUsd) return refused('cap_reached');
+    const [written] = await tx.executeRaw<{ reservation_window: string | null }>(`UPDATE page_embedding_budget SET embedding_signature = COALESCE($2, embedding_signature),
+        spent_usd = $3::float8, reserved_usd = $4::float8, ${RESERVED_AT_SQL('$4::float8', '$5::boolean')}, updated_at = now()
+      WHERE page_id = $1 RETURNING ${RESERVATION_WINDOW_SQL} AS reservation_window`,
+    [page.id, embeddingSignature, spent, reserved + estimate, reserved > 0]);
+    const grant: PageSpendGrant = {
+      reservedUsd: estimate, capUsd,
+      settle: ({ ok, usd }) => settleLedgerReservation(engine, { table: 'page_embedding_budget', pageId: page.id }, written?.reservation_window ?? null,
+        estimate, ok ? usd ?? estimate : 0),
+    };
+    return { kind: 'grant', grant } as const;
+  });
+}
+
+/** Rough characters per token and the system prompt overhead of one chat call, for a reservation estimate. */
+const CHARS_PER_TOKEN = 4;
+const PROMPT_OVERHEAD_TOKENS = 1500;
+/** Per-1M-token rates for a chat model without a price: the reservation still bounds the spend. */
+const UNPRICED_CHAT_RATE = { input: 15, output: 75 };
+
+/**
+ * What one chat call over `chars` of input may cost at most (the prompt estimate plus the full output ceiling), at the
+ * operator's `pricing.overrides` rate when one is set: the estimate a paid derivation reserves.
+ */
+export function estimateChatCallUsd(model: string, chars: number, maxOutputTokens: number, pricingOverrides?: PricingOverrides): number {
+  const input = Math.ceil(chars / CHARS_PER_TOKEN) + PROMPT_OVERHEAD_TOKENS;
+  return reservationCostUsd(model, 'chat', input, maxOutputTokens, pricingOverrides)
+    ?? (input * UNPRICED_CHAT_RATE.input + maxOutputTokens * UNPRICED_CHAT_RATE.output) / 1_000_000;
+}
+
+/** The worst case of one facts extraction (extract.ts): the call, a truncation retry at twice the output cap, and a malformed-output retry at that cap. */
+export function estimateFactsExtractionUsd(model: string, chars: number, maxOutputTokens: number, pricingOverrides?: PricingOverrides): number {
+  return estimateChatCallUsd(model, chars, maxOutputTokens, pricingOverrides) + 2 * estimateChatCallUsd(model, chars, 2 * maxOutputTokens, pricingOverrides);
+}
+
+/**
+ * A metered step's tracker, which also sums what the provider may have billed: every answered attempt at its reported
+ * usage (a success without reported usage at its estimate), and every failed call at what failedCallUsage says its
+ * attempts may have billed (`billed`): each attempt, a retry wrapper's every entry included, at its reported usage
+ * topped up with the attempt's worst case, unless the provider definitively refused it before generating (a 4xx other
+ * than 408 or 499, with no usage). A 5xx, a 529, a proxy's 499 or 504, a timeout, an abort or a reset connection is
+ * booked. An embedding that failed without reported usage is booked as nothing (the embedding ledger's own rule).
+ * The step runs with the SDK's hidden retries off (providerRetries 0), so each attempt is a call it reserved for.
+ *
+ * Each attempt is also reserved and recorded on the caller's tracker (`parent`) as it happens, so the caller's cap
+ * (`--max-usd`) counts every in-flight attempt of every worker, its own outstanding reservations included.
+ */
+class MeteredStepTracker extends BudgetTracker {
+  billedUsd = 0;
+  billedAttempts = 0;
+  unpricedAttempts = 0;
+  constructor(opts: ConstructorParameters<typeof BudgetTracker>[0], private readonly parent: BudgetTracker | null, private readonly pricing?: PricingOverrides) { super(opts); }
+
+  override reserve(estimate: Parameters<BudgetTracker['reserve']>[0]): ReturnType<BudgetTracker['reserve']> {
+    super.reserve(estimate);
+    return this.parent?.reserve(estimate);
+  }
+
+  override release(reservation: ReturnType<BudgetTracker['reserve']>): void {
+    this.parent?.release(reservation);
+  }
+
+  override record(actual: Parameters<BudgetTracker['record']>[0]): void {
+    const failed = actual.failed === true || (actual.label?.endsWith('.failed') ?? false);
+    const tokens = failed && actual.billed ? actual.billed : { inputTokens: actual.inputTokens, outputTokens: actual.outputTokens ?? 0 };
+    const unbilled = failed && (((actual.kind ?? 'chat') === 'embed' && actual.estimated === true) || (tokens.inputTokens === 0 && tokens.outputTokens === 0));
+    if (!unbilled) {
+      const cost = usageCostUsd(actual.modelId, tokens.inputTokens, tokens.outputTokens, actual.kind ?? 'chat', this.pricing);
+      this.billedAttempts++;
+      if (cost === null) this.unpricedAttempts++;
+      else this.billedUsd += cost;
+    }
+    recordOnTracker(this.parent, actual);
+    super.record({ ...actual, reservation: undefined });
+  }
+}
+
+/**
+ * Run one paid derivation step on `page` under its family's cap (wave-b spec 8.3): reserve `estimateUsd` (every attempt the
+ * step may make), run `call`, and book what its provider calls actually cost, read from a budget tracker scoped to the call.
+ * Every attempt the provider answered is booked whatever the step's outcome (a truncated, malformed or refused answer, a
+ * throw after the provider answered), and so is every failed attempt it may have billed (MeteredStepTracker); one it
+ * definitively refused before generating (a rate limit, an auth error) and a failed embedding are not; an unpriced
+ * model books the reservation; a step with no billed attempt books nothing. The attempts are reserved and recorded on
+ * the caller's tracker too, so the caller's cap bounds them. `unpricedModel` names the model when the step was refused
+ * under an unpriced model's ceiling estimate or booked its reservation because the model has no price: the caller's
+ * receipt then says `unpriced_model` (unpricedModelReceipt) and doctor derivation_unpriced_model names the fix. While a fact
+ * purge's derivation sweep covers the page (segment-derive.ts derivationSweepCoversPage) the step is refused with
+ * `purge_sweep_pending` before anything is reserved or called.
+ */
+export async function meterPaidCall<T>(engine: BrainEngine, page: BudgetPage, signature: PageSpendSignature, estimateUsd: number,
+  call: () => Promise<T>, opts: { pricingOverrides?: PricingOverrides } = {}): Promise<({ refused: Extract<PageSpendDecision, { kind: 'refused' }> } | { value: T }) & { unpricedModel?: string }> {
+  // A purge sweep covering the page would drop the step's checkpoint, so the step is not paid for until the sweep ends.
+  if (await derivationSweepCoversPage(engine, page.id)) return { refused: { kind: 'refused', reason: 'purge_sweep_pending', capUsd: 0, spentUsd: 0, reservedUsd: 0, estimateUsd } };
+  const decision = await reservePageSpend(engine, page, signature, estimateUsd);
+  // PR 4 (Wave B incremental derivation, transcripts): an unpriced model reserves the ceiling estimate, so a refusal under it is the missing price's.
+  const model = signature.slice(signature.indexOf(':') + 1);
+  const unpriced = reservationCostUsd(model, 'chat', 1, 1, opts.pricingOverrides) === null ? { unpricedModel: model } : {};
+  if (decision.kind === 'refused') return { refused: decision, ...unpriced };
+  if (decision.kind === 'unmetered') return { value: await call() };
+  const tracker = new MeteredStepTracker({ label: `page-spend:${signature}`, pricingOverrides: opts.pricingOverrides, providerRetries: 0 }, getCurrentBudgetTracker(), opts.pricingOverrides);
+  try {
+    const value = await withBudgetTracker(tracker, call);
+    return { value, ...(tracker.unpricedAttempts > 0 ? { unpricedModel: model } : {}) };
+  } finally {
+    await decision.grant.settle({ ok: tracker.billedAttempts > 0, usd: tracker.unpricedAttempts > 0 ? decision.grant.reservedUsd : tracker.billedUsd });
+  }
+}
+
 export interface PageBudgetReport { slug: string; source_id: string; state: Exclude<PageBudgetState, 'open'>; reason: string | null;
   spent_usd: number; cap_usd: number | null; pending_chunks: number; pending_chars: number }
 
-/** Estimated provider cost of embedding `chars` of chunk text with the model in `signature` (unknown models use the conservative rate). */
+/** Estimated provider cost of embedding `chars` of chunk text with the model in `signature` (unknown models use the conservative rate, free recipes $0). */
 export function estimatePageEmbedUsd(chars: number, signature: string | null | undefined): number {
-  return estimateCostFromChars(chars, currentPricePerMTok(signature).rate);
+  return estimateCostFromChars(chars, ledgerPricePerMTok(signature).rate);
 }
 
-/** Held and capped pages with their stale chunk counts (doctor `partial_embedding`, `gbrain embed --held`). */
-export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeRaw'>, opts: { state?: 'held' | 'capped'; sourceId?: string; limit?: number } = {}): Promise<PageBudgetReport[]> {
-  const params: unknown[] = [opts.limit ?? 1000];
-  const filters = [`b.state <> 'open'`, 'p.deleted_at IS NULL'];
+/** Held and capped pages with their stale chunk counts (`gbrain embed --held`); `limit: null` lists every one. */
+export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeRaw'>, opts: { state?: 'held' | 'capped'; sourceId?: string; limit?: number | null } = {}): Promise<PageBudgetReport[]> {
+  const params: unknown[] = [opts.limit === undefined ? 1000 : opts.limit];
+  // #7185: an embed_skip page is never embedded, so a hold on one (a backfill rewrite that did not land) is not approvable work.
+  const filters = [budgetRowAppliesFilter('b', 'p'), 'p.deleted_at IS NULL', `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`];
   if (opts.state) filters.push(`b.state = $${params.push(opts.state)}`);
   if (opts.sourceId) filters.push(`p.source_id = $${params.push(opts.sourceId)}`);
   const pending = `(CASE WHEN p.body_storage = 'segmented' THEN cc.${quoteIdentifier((await embeddingWriteTarget(engine)).column.name)} IS NULL ELSE cc.embedded_at IS NULL END)`;
@@ -202,12 +340,12 @@ export async function listBudgetLimitedPages(engine: Pick<BrainEngine, 'executeR
       (SELECT count(*)::int FROM content_chunks cc WHERE cc.page_id = p.id AND ${pending} AND ${chunkGenerationFilter('p', 'cc')}) AS pending_chunks,
       (SELECT COALESCE(sum(length(cc.chunk_text)), 0)::bigint FROM content_chunks cc WHERE cc.page_id = p.id AND ${pending} AND ${chunkGenerationFilter('p', 'cc')}) AS pending_chars
     FROM page_embedding_budget b JOIN pages p ON p.id = b.page_id
-    WHERE ${filters.join(' AND ')} ORDER BY b.updated_at DESC, p.id LIMIT $1`, params);
+    WHERE ${filters.join(' AND ')} ORDER BY b.updated_at DESC, p.id LIMIT $1::int`, params);
   return rows.map(row => ({ ...row, spent_usd: Number(row.spent_usd), cap_usd: row.cap_usd === null ? null : Number(row.cap_usd), pending_chunks: Number(row.pending_chunks), pending_chars: Number(row.pending_chars) }));
 }
 
 /** Run the provider call under a grant: booked as spent once it returns, released if it throws. */
-export async function spendGrant<T>(grant: PageEmbedGrant | undefined, call: () => Promise<T>): Promise<T> {
+export async function spendGrant<T>(grant: Pick<PageEmbedGrant, 'settle'> | undefined, call: () => Promise<T>): Promise<T> {
   if (!grant) return call();
   try {
     const out = await call();
@@ -219,52 +357,36 @@ export async function spendGrant<T>(grant: PageEmbedGrant | undefined, call: () 
   }
 }
 
+/** The approve command for one page's waiting chunks, with a concrete --max-usd ceiling (held-embedding-action.ts). */
+async function pageApproveCommand(page: { slug: string; source_id?: string }, waiting: ReadonlyArray<{ chunk_text: string }>): Promise<string> {
+  const basis = await approvalBasis();
+  const amount = approvalAmount(waiting.reduce((n, c) => n + c.chunk_text.length, 0), basis);
+  return renderedCommand(heldApproveAction({ source_id: page.source_id ?? 'default', slug: page.slug, pending_chunks: waiting.length, ...amount }, basis.free));
+}
+
 /**
  * One embedding run's per-page step: meter `candidates` (the page's chunks
  * without a vector) and narrow them to the grant, saying on stderr why chunks
  * wait. Null means embed nothing now (held, or the cap left no chunk);
  * otherwise `chunks` is the batch to embed, every candidate on an unmetered page.
  */
-export async function meterPageBatch<C extends { chunk_index: number; chunk_text: string }>(engine: BrainEngine, page: BudgetPage & { slug: string },
+export async function meterPageBatch<C extends { chunk_index: number; chunk_text: string }>(engine: BrainEngine, page: BudgetPage & { slug: string; source_id?: string },
   candidates: readonly C[], opts: { signature?: string | null; approvedCapUsd?: number; announceHeld?: boolean }): Promise<{ grant?: PageEmbedGrant; chunks: C[] } | null> {
   const decision = await planPageEmbedding(engine, page, candidates, opts);
   if (decision.kind === 'unmetered') return { chunks: [...candidates] };
-  const approve = `gbrain embed --slugs ${page.slug} --max-usd <N>`;
   if (decision.kind === 'held') {
-    if (opts.announceHeld) process.stderr.write(`[embed] ${page.slug}: embedding held (${decision.reason}); the page stays keyword-searchable. Approve with: ${approve}\n`);
+    if (opts.announceHeld) process.stderr.write(`[embed] ${page.slug}: embedding held (${decision.reason}); the page stays keyword-searchable. With the user's approval: ${await pageApproveCommand(page, candidates)}\n`);
     return null;
   }
   const { grant } = decision;
   const chunks = candidates.filter(c => grant.chunkIndexes.has(c.chunk_index));
-  if (grant.deferred) process.stderr.write(`[embed] ${page.slug}: per-page cap $${grant.capUsd.toFixed(2)} reached; ${grant.deferred} older chunk(s) stay keyword-only until it rises (${approve})\n`);
+  if (grant.deferred) {
+    const waiting = candidates.filter(c => !grant.chunkIndexes.has(c.chunk_index));
+    process.stderr.write(`[embed] ${page.slug}: per-page cap $${grant.capUsd.toFixed(2)} reached; ${grant.deferred} older chunk(s) stay keyword-only until it rises (${await pageApproveCommand(page, waiting)})\n`);
+  }
   if (chunks.length) return { grant, chunks };
   await grant.settle({ ok: true });
   return null;
-}
-
-/**
- * `gbrain embed --held`: list the held and capped large pages with what each
- * would cost to finish, then return the `--source S --slugs ...` argv that
- * embeds them under the user's `--max-usd` (one source per approval).
- */
-export async function heldEmbedArgv(engine: BrainEngine, args: readonly string[], signature: string | null, say: (line: string) => void): Promise<{ argv: string[] } | { error: string } | null> {
-  if (args.includes('--background')) return { error: '[embed] --held runs in the foreground: the per-page approval is not carried into background jobs.' };
-  const sourceIdx = args.indexOf('--source');
-  const limited = await listBudgetLimitedPages(engine, sourceIdx >= 0 ? { sourceId: args[sourceIdx + 1] } : {});
-  if (limited.length === 0) {
-    say('[embed] No large pages are held or capped by embed.max_usd_per_page.');
-    return null;
-  }
-  for (const row of limited) {
-    say(`[embed] ${row.slug} (${row.source_id}): ${row.state}${row.reason ? ` (${row.reason})` : ''}, ${row.pending_chunks} chunk(s) without a vector, `
-      + `spent $${row.spent_usd.toFixed(2)}, about $${estimatePageEmbedUsd(row.pending_chars, signature).toFixed(2)} to finish`);
-  }
-  const sources = [...new Set(limited.map(row => row.source_id))];
-  if (sources.length > 1) {
-    return { error: `[embed] Held pages span ${sources.length} sources; one approval covers one source. Run per source: ${sources.map(id => `gbrain embed --held --source ${id} --max-usd <N>`).join('; ')}` };
-  }
-  const rest = args.filter((a, i) => a !== '--held' && a !== '--source' && args[i - 1] !== '--source');
-  return { argv: [...rest, '--source', sources[0], '--slugs', ...limited.map(row => row.slug)] };
 }
 
 /**
@@ -283,16 +405,17 @@ export function pageSizeState(bytes: number, frontmatter: Record<string, unknown
   if (isEmbedSkipped(frontmatter)) {
     return { embedding: 'skipped', reason: (frontmatter!.embed_skip as { reason?: unknown } | null)?.reason === 'oversized' ? 'oversized' : 'operator_marker', bytes };
   }
-  if (budget?.state === 'held') return { embedding: 'held', reason: budget.reason ?? 'awaiting_approval', bytes };
-  if (budget?.state === 'capped') return { embedding: 'partial', reason: 'spend_cap', bytes };
-  return isLargePageBytes(bytes) || segmented ? { embedding: 'deferred', reason: 'large_page', bytes } : null;
+  const large = isLargePageBytes(bytes);
+  if (large && budget?.state === 'held') return { embedding: 'held', reason: budget.reason ?? 'awaiting_approval', bytes };
+  if (large && budget?.state === 'capped') return { embedding: 'partial', reason: 'spend_cap', bytes };
+  return large || segmented ? { embedding: 'deferred', reason: 'large_page', bytes } : null;
 }
 
 /**
  * pageSizeState for stored pages of one source with a non-null state: the given slugs, or (null) every
  * such page in the source, as a full sync walked them all.
  */
-export async function readPageSizeStates(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, slugs: readonly string[] | null): Promise<Array<{ slug: string } & PageSizeState>> {
+export async function readPageSizeStates(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, slugs: readonly string[] | null): Promise<Array<{ slug: string; source_id?: string } & PageSizeState>> {
   if (slugs?.length === 0) return [];
   const bytes = `(CASE WHEN p.body_storage = 'segmented' THEN p.body_bytes ELSE octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) END)`;
   const rows = await engine.executeRaw<{ slug: string; bytes: number; segmented: boolean; frontmatter: Record<string, unknown> | null; state: PageBudgetState | null; reason: string | null }>(
@@ -303,7 +426,7 @@ export async function readPageSizeStates(engine: Pick<BrainEngine, 'executeRaw'>
     slugs ? [sourceId, PAGE_INLINE_MAX_BYTES, [...slugs]] : [sourceId, PAGE_INLINE_MAX_BYTES]);
   return rows.flatMap(row => {
     const state = pageSizeState(Number(row.bytes), row.frontmatter, row.state ? { state: row.state, reason: row.reason } : null, row.segmented === true);
-    return state ? [{ slug: row.slug, ...state }] : [];
+    return state ? [{ slug: row.slug, ...(state.embedding === 'held' ? { source_id: sourceId } : {}), ...state }] : [];
   });
 }
 
@@ -318,10 +441,10 @@ export async function sizeStateField(engine: Pick<BrainEngine, 'executeRaw'>, so
 }
 
 /** #6722: the sync receipt's tally of pages a run left large or embed_skip: the total and the first SIZE_STATE_SAMPLE. */
-export interface SyncSizeStates { total: number; pages: Array<{ slug: string; path?: string } & PageSizeState> }
+export interface SyncSizeStates { total: number; pages: Array<{ slug: string; path?: string; source_id?: string } & PageSizeState> }
 export const SIZE_STATE_SAMPLE = 50;
 
-export function addSizeState(tally: SyncSizeStates | undefined, entry: { slug: string; path?: string } & PageSizeState): SyncSizeStates {
+export function addSizeState(tally: SyncSizeStates | undefined, entry: { slug: string; path?: string; source_id?: string } & PageSizeState): SyncSizeStates {
   const pages = tally?.pages ?? [];
   return { total: (tally?.total ?? 0) + 1, pages: pages.length < SIZE_STATE_SAMPLE ? [...pages, entry] : pages };
 }
@@ -329,12 +452,24 @@ export function addSizeState(tally: SyncSizeStates | undefined, entry: { slug: s
 /** One line per sampled page for the sync output, and the rest as a count. */
 export function sizeStateLines(tally: SyncSizeStates | undefined): string[] {
   if (!tally?.total) return [];
-  const what = (s: PageSizeState) => s.embedding === 'skipped'
+  const what = (s: PageSizeState & { source_id?: string }) => s.embedding === 'skipped'
     ? `no vectors (${s.reason === 'oversized' ? 'over the content_sanity.bytes_block limit' : 'embed_skip marker'}); chunks keep it in keyword search`
-    : s.embedding === 'held' ? `embedding held (${s.reason}); \`gbrain reindex --held\` previews the cost`
+    : s.embedding === 'held' ? `embedding held (${s.reason}); \`${heldPreviewCommand(s.source_id)}\` previews the cost`
     : s.embedding === 'partial' ? 'partly embedded under embed.max_usd_per_page; the rest stays keyword-only'
     : 'large page; embedding runs after the commit under embed.max_usd_per_page';
   const lines = tally.pages.slice(0, 20).map(p => `  Size ${p.path ?? p.slug} (${p.bytes} bytes): ${what(p)}.`);
   if (tally.total > lines.length) lines.push(`  ... and ${tally.total - lines.length} more large or embed_skip page(s) (--json lists the first ${tally.pages.length}).`);
   return lines;
+}
+
+/**
+ * The receipt a segmented derivation occurrence carries when its model has no price (PR 4, Wave B incremental
+ * derivation): an unread_windows receipt the cap stopped under the model's ceiling estimate says reason `unpriced_model`
+ * and the model; a finished one that booked a reservation for an unpriced call is `{ kind: 'unpriced_model', model }`.
+ * Doctor derivation_unpriced_model reads both. `stop` is the run's stop reason; `unread` the windows left, if any.
+ */
+export function unpricedModelReceipt(pipeline: string, model: string | null, stop: string | null,
+  unread: { windows_read: number; windows_total: number } | null): Record<string, unknown> | null {
+  if (unread) return { kind: 'unread_windows', pipeline, reason: model && stop === 'cap_reached' ? 'unpriced_model' : stop, ...unread, ...(model ? { model } : {}) };
+  return model ? { kind: 'unpriced_model', pipeline, model } : null;
 }

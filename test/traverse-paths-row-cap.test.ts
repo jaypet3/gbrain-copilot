@@ -61,7 +61,7 @@ describe('traversePaths row cap (PGLite)', () => {
 
   test('traversePaths (the GraphPath[] projection) honours the same cap', async () => {
     const paths = await engine.traversePaths(DENSE_HUB_SLUG, { depth: 3, direction: 'both' });
-    // Pre-cap: 5,200 deduped edges (every edge at depth 2 AND depth 3).
+    // Pre-cap: 5,200 edges (every edge of the fixture, each once).
     expect(paths.length).toBeLessThanOrEqual(TRAVERSE_PATH_ROW_CAP);
     const detailed = await engine.traversePathsDetailed(DENSE_HUB_SLUG, { depth: 3, direction: 'both' });
     expect(paths).toEqual(detailed.paths);
@@ -76,12 +76,15 @@ describe('traversePaths row cap (PGLite)', () => {
 
   test('traverse_graph op: truncation is a stderr note, the GraphPath[] wire shape is unchanged', async () => {
     const warnings: string[] = [];
-    const result = await operationsByName.traverse_graph.handler(ctx(m => warnings.push(m)), {
+    const notices: Array<{ code: string; kind: string }> = [];
+    const result = await operationsByName.traverse_graph.handler({ ...ctx(m => warnings.push(m)), emitNotice: (n: { code: string; kind: string }) => notices.push(n) } as unknown as OperationContext, {
       slug: DENSE_HUB_SLUG, depth: 3, direction: 'both',
     }) as unknown[];
     expect(Array.isArray(result)).toBe(true);
     expect(result.length).toBeLessThanOrEqual(TRAVERSE_PATH_ROW_CAP);
     expect(warnings.some(w => w.includes('truncated') && w.includes(String(TRAVERSE_PATH_ROW_CAP)))).toBe(true);
+    // GBRA-200: MCP callers get a per-call degraded notice, which dispatch stamps.
+    expect(notices.map(n => `${n.code}:${n.kind}`)).toEqual(['graph_walk_truncated:degraded']);
 
     const quiet: string[] = [];
     await operationsByName.traverse_graph.handler(ctx(m => quiet.push(m)), {

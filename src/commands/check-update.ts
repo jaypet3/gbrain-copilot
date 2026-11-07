@@ -8,8 +8,9 @@ import {
   semverGt,
   semverLte,
 } from '../core/semver.ts';
-import { readUpdateCache, writeUpdateCache, type UpdateMarker } from '../core/self-upgrade.ts';
-import { DEFAULT_BRANCH, GITHUB_URL, RAW_BASE_URL } from '../core/repo-coordinates.ts';
+import { readUpdateCache, resolveReleaseChannel, writeUpdateCache, type ReleaseChannel, type UpdateMarker } from '../core/self-upgrade.ts';
+import { loadConfig } from '../core/config.ts';
+import { DEFAULT_BRANCH, GITHUB_URL, RAW_BASE_URL, rawUrlAt } from '../core/repo-coordinates.ts';
 
 /** Best-effort cache write — a read-only ~/.gbrain must never make the check throw. */
 function safeWriteCache(marker: UpdateMarker): void {
@@ -46,16 +47,28 @@ function upgradeCommandForMethod(method: string): string {
   }
 }
 
-/** Where the latest version is resolved from. The release train's source of
- * truth is the `VERSION` file on master — same trusted host `fetchChangelog`
- * already uses. GitHub releases are published from it per VERSION bump
- * (`.github/workflows/release.yml`, #3521) and carry the binary assets, but
- * this check deliberately does NOT read `releases/latest`: it was a permanent
- * 404 before releases existed (#3520) and can still lag master. An npm
+/** Where the latest version is resolved from: the VERSION file at the
+ * `latest-stable` tag, the one sanctioned distribution ref
+ * (`bun install -g github:garrytan/gbrain#latest-stable`). release.yml moves
+ * it only after the release checks pass and the assets publish, so it names a
+ * published release, the one `bun update` installs on the canonical install.
+ * Master's VERSION is NOT a release: the next PR stamps it before release.yml
+ * mints its tag, and a superseded version never gets one, so offering it made
+ * the auto channel "upgrade" to a version the install could not reach and
+ * blocklist it (#6718, #6828). Same trusted host as before. `releases/latest`
+ * stays unread: it was a permanent 404 before releases existed (#3520). An npm
  * fallback was rejected: the `gbrain` package on npm is an unrelated GPU
  * library (#505), so it would produce false upgrade prompts pointing at a
- * stranger's package. */
-const VERSION_SOURCE_URL = `${RAW_BASE_URL}/VERSION`;
+ * stranger's package. A brain on the stable channel (`self_upgrade.channel
+ * stable`) reads the VERSION file at the `stable` tag instead: the newest
+ * release a maintainer promoted after the production-shaped soak passed on its
+ * exact tree (.github/workflows/promote-stable.yml). */
+// gbrain-copilot: this fork publishes no `latest-stable` tag; its default
+// branch only advances through release-gated PRs, so the latest channel reads
+// DEFAULT_BRANCH. The stable channel reads the fork's `stable` tag.
+const RELEASE_REF_RAW = RAW_BASE_URL;
+export const CHANNEL_REFS: Record<ReleaseChannel, string> = { latest: DEFAULT_BRANCH, stable: 'stable' };
+const versionSourceUrl = (channel: ReleaseChannel) => `${rawUrlAt(CHANNEL_REFS[channel])}/VERSION`;
 const RELEASE_NOTES_URL = `${GITHUB_URL}/blob/${DEFAULT_BRANCH}/CHANGELOG.md`;
 
 /** Extract a version from the raw VERSION file body: first line, optional `v`
@@ -73,16 +86,16 @@ export type LatestReleaseResult =
   | { ok: false; reason: 'network_error' | 'no_releases' };
 
 /**
- * Resolve the latest published gbrain version (from VERSION on master — see
- * VERSION_SOURCE_URL). Exported (v0.42) so the self-upgrade refresh path and
+ * Resolve the newest gbrain version on a release channel (from VERSION at the
+ * channel's tag — see CHANNEL_REFS). Exported (v0.42) so the self-upgrade refresh path and
  * tests can reuse it. 5s timeout — this runs on the detached refresh, never the
  * hot path. Failures are discriminated: `network_error` (offline/timeout) vs
  * `no_releases` (endpoint answered but no usable version).
  */
-export async function fetchLatestRelease(): Promise<LatestReleaseResult> {
+export async function fetchLatestRelease(channel: ReleaseChannel = resolveReleaseChannel(loadConfig())): Promise<LatestReleaseResult> {
   let res: Response;
   try {
-    res = await fetch(VERSION_SOURCE_URL, {
+    res = await fetch(versionSourceUrl(channel), {
       headers: { 'User-Agent': `gbrain/${VERSION}` },
       signal: AbortSignal.timeout(5_000),
     });
@@ -101,7 +114,7 @@ export async function fetchLatestRelease(): Promise<LatestReleaseResult> {
 
 export async function fetchChangelog(currentVersion: string, latestVersion: string): Promise<string> {
   try {
-    const res = await fetch(`${RAW_BASE_URL}/CHANGELOG.md`, {
+    const res = await fetch(`${RELEASE_REF_RAW}/CHANGELOG.md`, {
       signal: AbortSignal.timeout(5_000),
     });
     if (!res.ok) return '';
@@ -208,10 +221,10 @@ export async function runCheckUpdate(args: string[]) {
   }
 
   const json = args.includes('--json');
-  const method = detectInstallMethod();
-  const upgradeCmd = upgradeCommandForMethod(method);
+  const channel = resolveReleaseChannel(loadConfig());
+  const upgradeCmd = channel === 'stable' ? 'gbrain upgrade' : upgradeCommandForMethod(detectInstallMethod());
 
-  const release = await fetchLatestRelease();
+  const release = await fetchLatestRelease(channel);
 
   if (!release.ok) {
     preserveCacheOnFailedCheck();

@@ -27,6 +27,8 @@ import type { ServeHttpContext } from './serve-http.ts';
 import { NO_SOURCES } from '../core/source-id.ts';
 import { noSourceGrantError } from '../core/ops/context.ts';
 import { renderAction } from '../core/agent-output.ts';
+import { assertWebhookWriterMayReplace } from '../core/minions/handlers/ingest-capture.ts';
+import { validateSlug } from '../core/utils.ts';
 
 /**
  * v0.46: normalize the per-event GitHub webhook payload shape into
@@ -468,14 +470,33 @@ async function handleIngest(
     return;
   }
 
+  // The job re-checks this writer at write time; refusing here answers the caller before anything is queued.
+  const writeSourceId = authInfo.sourceId ?? 'default';
+  const writer = authInfo.principal ? { principal: { kind: authInfo.principal.kind, id: authInfo.principal.id } } : undefined;
+  if (callerSlug) {
+    try {
+      validateSlug(callerSlug);
+    } catch (err) {
+      res.status(400).json({ error: 'invalid_slug', message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    try {
+      await assertWebhookWriterMayReplace(engine, writer, writeSourceId, callerSlug);
+    } catch (err) {
+      if (!(err instanceof OperationError)) throw err;
+      res.status(err.code === 'page_not_found' ? 404 : 403).json({ error: err.code, message: err.message });
+      return;
+    }
+  }
+
   try {
-    const writeSourceId = authInfo.sourceId ?? 'default';
     const job = await ingestQueue.add(
       'ingest_capture',
       {
         event,
         ...(callerSlug ? { slug: callerSlug } : {}),
         sourceId: writeSourceId,
+        ...(writer ? { writer } : {}),
       },
       {
         // Idempotency: same content from the same client within the
@@ -662,15 +683,23 @@ function mountGitHubWebhook(app: Express, ctx: ServeHttpContext): void {
         res.status(500).json({ error: 'lookup_failed' });
         return;
       }
-      if (!source) {
-        res.status(404).json({ error: 'unknown_repo', repo: fullName });
-        return;
-      }
-
-      const cfg = (typeof source.config === 'string' ? JSON.parse(source.config) : source.config) as {
+      const cfg = (source ? (typeof source.config === 'string' ? JSON.parse(source.config) : source.config) : {}) as {
         webhook_secret?: string;
         tracked_branch?: string;
       };
+
+      // HMAC verify before anything about the repository is answered: an unknown repo, a source with no secret and a
+      // bad signature all get the same 401, so an unsigned request cannot tell which repositories this brain syncs.
+      // GitHub sends "sha256=<hex>" — strip the prefix BEFORE safeHexEqual because Buffer.from('sha256=...', 'hex')
+      // silently truncates at the first non-hex char (the 's'), leaving both operands as 0-byte buffers and making
+      // every signature "match". Strict hex shape first: a malformed 64-char signature would make safeHexEqual throw.
+      const secret = cfg.webhook_secret;
+      const computedHex = typeof secret === 'string' && secret ? createHmac('sha256', secret).update(payload).digest('hex') : null;
+      if (!source || !computedHex || !/^sha256=[0-9a-f]{64}$/.test(sigHeader) || !safeHexEqual(sigHeader.slice('sha256='.length), computedHex)) {
+        if (source && !computedHex) console.error(`webhook: push for source ${source.id} refused: no webhook secret is set (run: gbrain sources webhook set ${source.id})`);
+        res.status(401).json({ error: 'signature_mismatch' });
+        return;
+      }
 
       // D5: ref must match the configured tracked branch (default 'main').
       const trackedBranch = cfg.tracked_branch ?? 'main';
@@ -685,48 +714,8 @@ function mountGitHubWebhook(app: Express, ctx: ServeHttpContext): void {
         return;
       }
 
-      const secret = cfg.webhook_secret;
-      if (!secret || typeof secret !== 'string') {
-        res.status(401).json({ error: 'webhook_not_configured', message: 'Run: gbrain sources webhook set ' + source.id });
-        return;
-      }
-
-      // HMAC verify. GitHub sends "sha256=<hex>" — strip the prefix BEFORE
-      // safeHexEqual because Buffer.from('sha256=...', 'hex') silently
-      // truncates at the first non-hex char (the 's'), leaving both
-      // operands as 0-byte buffers and making every signature "match".
-      // Strict hex shape first: a malformed 64-char signature would make
-      // safeHexEqual throw (500 instead of 401), codex LOW.
-      const { createHmac } = await import('node:crypto');
-      const computedHex = createHmac('sha256', secret).update(payload).digest('hex');
-      const prefix = 'sha256=';
-      if (!/^sha256=[0-9a-f]{64}$/.test(sigHeader)) {
-        res.status(401).json({ error: 'signature_mismatch', message: 'expected sha256=<64 hex> signature' });
-        return;
-      }
-      if (!safeHexEqual(sigHeader.slice(prefix.length), computedHex)) {
-        res.status(401).json({ error: 'signature_mismatch' });
-        return;
-      }
-
-      // Submit sync job with priority -10 (above autopilot's 0).
       try {
-        const queue = new MinionQueue(engine);
-        const job = await queue.add(
-          'sync',
-          {
-            sourceId: source.id,
-            noExtract: false,
-            auto_embed_backfill: true,
-            embed_reason: 'webhook',
-          },
-          {
-            priority: -10,
-            idempotency_key: `webhook:sync:${source.id}:${Math.floor(Date.now() / 30_000)}`,
-            maxWaiting: 1,
-          },
-        );
-        res.status(202).json({ job_id: job.id, source_id: source.id });
+        await submitGitHubPush(engine, source.id, (parsed as { after?: unknown }).after, res);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('webhook: queue submission error:', msg);
@@ -734,4 +723,49 @@ function mountGitHubWebhook(app: Express, ctx: ServeHttpContext): void {
       }
     },
   );
+}
+
+const PUSHED_SHA = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+/** The part of an Express response the push answer writes. */
+export interface PushAnswerSink { status(code: number): { json(body: unknown): unknown } }
+
+/**
+ * GBRA-133 PR 2a.3: a verified push for a tracked branch. The pushed commit is recorded as a wanted marker first, so
+ * it is never lost to coalescing: a classic source queues one sync (priority -10, single flight per source through
+ * maxPending 1; this replaced the 30 s idempotency bucket, which dropped a second push inside the bucket while the
+ * first job ran) and a later run re-checks the marker. A managed source never pulls, so instead of a 202 for a job
+ * that cannot import the push it answers refresh_required (409) with the gbrain sources refresh fix, keeping the
+ * marker until the source reaches that commit.
+ */
+export async function submitGitHubPush(engine: BrainEngine, sourceId: string, after: unknown, res: PushAnswerSink): Promise<void> {
+  const wantedHead = typeof after === 'string' && PUSHED_SHA.test(after) && !/^0+$/.test(after) ? after : null;
+  const { recordTriggerMarker } = await import('../core/notifier/nudge.ts');
+  const recorded = await recordTriggerMarker(engine, { sourceId, intent: 'pull', wantedHead, requestedBy: 'webhook' });
+  if (!recorded) { res.status(404).json({ error: 'unknown_source', source_id: sourceId }); return; }
+  const { marker, managed } = recorded;
+  const base = { source_id: sourceId, wanted_head: marker.wanted_head, marker_generation: marker.generation };
+  if (managed) {
+    const { opError } = await import('../core/ops/contract.ts');
+    const error = opError('refresh_required', `A push arrived for managed source ${sourceId}; a managed source never pulls, so the pushed commit waits for a refresh.`,
+      `Run gbrain sources refresh ${sourceId} on the brain host; the resident notifier then syncs the refreshed checkout.`,
+      { fix: { argv: ['gbrain', 'sources', 'refresh', sourceId], consent: [], actor: 'user', requires_exclusive: false,
+        why: 'Fast-forwards the managed checkout to its upstream under the writer lock and runs the managed --no-pull sync.' } });
+    res.status(409).json({ ...error.toJSON(), ...base, status: 'refresh_required' });
+    return;
+  }
+  const queue = new MinionQueue(engine);
+  const job = await queue.add(
+    'sync',
+    {
+      sourceId,
+      noExtract: false,
+      auto_embed_backfill: true,
+      embed_reason: 'webhook',
+    },
+    { priority: -10, maxPending: 1 },
+  );
+  const { attachMarkerJob } = await import('../core/notifier/store.ts');
+  await attachMarkerJob(engine, sourceId, marker.intent, marker.generation, job.id);
+  res.status(202).json({ job_id: job.id, ...base, action: job.coalesced ? 'coalesced' : 'queued' });
 }

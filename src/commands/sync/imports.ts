@@ -25,15 +25,19 @@ import {
 import { isPathSafe } from '../../core/sync-git.ts';
 import { resolveStallAbortSeconds, composeAbortSignals } from '../../core/sync-reconcile.ts';
 import { sanitizePathForDisplay } from '../../core/sync.ts';
+import { syncFailureCode } from '../../core/sync-failure-ledger.ts';
 import { isWindowsColonTarget } from '../../core/persistence/native-file-target.ts';
 import { ERROR_CATALOGUE } from '../../core/error-catalogue.ts';
 import { enginePoolStats } from '../../core/postgres-engine/pool-stats.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
-import { clearLegacyHold, holdRefusedImport, noteScreenedImport, type LegacyHolds } from './holds.ts';
+import { clearLegacyHold, holdClassicFile, holdRefusedImport, noteScreenedImport, type LegacyHolds } from './holds.ts';
+import { classifyClassicFile } from '../../core/classic-file-holds.ts';
 import { partial, markCompleted, noteTypeWarning, maybeYield } from './sync-run.ts';
+import { fileHistory } from './reasons.ts';
 import type { SyncPlan, SyncProgress, SyncRun } from './sync-run.ts';
+import { noteCommittedProgress } from '../../core/forward-progress.ts';
 
-type ImportPlan = Pick<SyncPlan, 'opts' | 'filtered' | 'lastCommit' | 'pin' | 'company' | 'gitContextRoot' | 'syncImportRoot' | 'syncActivePack' | 'holds'>;
+type ImportPlan = Pick<SyncPlan, 'opts' | 'filtered' | 'lastCommit' | 'pin' | 'company' | 'gitContextRoot' | 'syncImportRoot' | 'syncActivePack' | 'holds' | 'reasons'>;
 
 type ImportContext = {
   opts: SyncOpts;
@@ -46,6 +50,7 @@ type ImportContext = {
   progressAt: { last: number };
   progress: SyncProgress;
   holds: LegacyHolds | null;
+  reasons: SyncPlan['reasons'];
 };
 
 /** The add/modify drain. Returns a partial result when the run aborts. */
@@ -56,7 +61,7 @@ export async function runImportsPhase(
   noEmbed: boolean,
 ): Promise<SyncResult | undefined> {
   const { engine, completed } = run;
-  const { filtered, company, gitContextRoot, syncImportRoot, syncActivePack, holds } = plan;
+  const { filtered, company, gitContextRoot, syncImportRoot, syncActivePack, holds, reasons } = plan;
   let { opts } = plan;
   // Process adds and modifies.
   //
@@ -89,6 +94,13 @@ export async function runImportsPhase(
   // a killed run banks `completed`, the next run skips it (no per-file disk
   // read or content_hash DB lookup for done files).
   const importsToDo = resumeFilter(addsAndMods, [...completed]);
+  // GBRA-130 A-18: files an earlier run of this drain already banked count as
+  // the breaker's successes, so a resumed run that re-attempts only the
+  // failing files is not mistaken for a run where most files fail.
+  for (let i = importsToDo.length; i < addsAndMods.length; i++) run.itemRun.succeed();
+  // Their imports still prove other files of this drain import, so an infra
+  // failure the resumed run re-attempts alone keeps its isolated streak.
+  run.bankedImports = addsAndMods.filter(path => completed.has(path) && !holds?.existing.has(path)).length;
 
   const { effectiveConcurrency, runParallel } = await resolveImportConcurrency(engine, opts, importsToDo.length);
 
@@ -107,7 +119,7 @@ export async function runImportsPhase(
     opts = watchdog.opts;
     const { stallTimer, progressAt } = watchdog;
 
-    const ctx: ImportContext = { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds };
+    const ctx: ImportContext = { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds, reasons };
     const aborted = await drainImports(run, plan, ctx, importsToDo, effectiveConcurrency, runParallel, stallTimer);
     if (aborted) return aborted;
 
@@ -257,7 +269,7 @@ export function poolLine(engine: unknown): string {
 /** Core import logic shared by the serial and parallel paths. */
 async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine, path: string): Promise<void> {
   const { failedFiles, succeededPaths, pagesAffected, deletedSlugs } = run;
-  const { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds } = ctx;
+  const { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds, reasons } = ctx;
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `path` is a git-diff path from the synced repo (repo content can be hostile), but the joined path is checked by isPathSafe(filePath, gitContextRoot) realpath containment below before any read
   const filePath = join(syncRepoPath, path);
   // #5032: Windows cannot store ':' in a file name (it names an alternate data
@@ -268,6 +280,16 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
       + `Rename it without ':' on a macOS or Linux checkout and commit, then run gbrain sync${opts.sourceId ? ` --source ${opts.sourceId}` : ''} (${ERROR_CATALOGUE.colon_slug_windows_write_through.docs}).` });
     progressAt.last = Date.now();
     progress.tick(1, `skip:${path}`);
+    return;
+  }
+  // GBRA-133: a symlink, a permission error or a committed file missing from
+  // the working tree is held (re-screened every run), never failed: it stays
+  // out of failedFiles and the auto-skip streak, so it never gates the bookmark.
+  const unreadable = holds?.active && !company ? classifyClassicFile(syncRepoPath, path, gitContextRoot) : null;
+  if (unreadable && await holdClassicFile(eng, holds!, path, unreadable)) {
+    await markCompleted(run, path);
+    progressAt.last = Date.now();
+    progress.tick(1, `held:${path}`);
     return;
   }
   if (!company && !existsSync(filePath)) {
@@ -333,7 +355,7 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
     const result = await observed(pacer, () =>
       isImageImportPath(path) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? importImageFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId })
-        : company ? importCompanyBrainFile(eng, filePath, opts.sourceId!) : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
+        : company ? importCompanyBrainFile(eng, filePath, opts.sourceId!) : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack, history: fileHistory(reasons, filePath) }));
     noteTypeWarning(run, result.type_warning);
     noteScreenedImport(holds, path, result);
     if (await holdRefusedImport(eng, holds, path, filePath, result)) {
@@ -351,6 +373,8 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
       // persist. partial() reports this so cron operators see how
       // much actually landed before --timeout fired.
       run.filesImported++;
+      run.itemRun.succeed();
+      noteCommittedProgress();
       await clearLegacyHold(eng, holds, path);
       // v0.42.x (#1794): checkpoint this path so a kill banks it.
       await markCompleted(run, path);
@@ -376,12 +400,16 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
       await markCompleted(run, path);
     }
   } catch (e: unknown) {
+    // GBRA-130 A-18: a run-scoped failure (lost connection, failed
+    // transaction, abort, an unavailable writer) stops the sync before the
+    // ledger records anything; a file's own failure carries a structured code.
+    run.itemRun.record(path, e);
     const msg = e instanceof Error ? e.message : String(e);
     if (await holdRefusedImport(eng, holds, path, filePath, { status: 'error', error: msg })) {
       await markCompleted(run, path);
     } else {
       serr(`  Warning: skipped ${path}: ${msg}`);
-      failedFiles.push({ path, error: msg });
+      failedFiles.push({ path, error: msg, code: syncFailureCode(e, path) });
     }
   } finally {
     permit.release();

@@ -15,7 +15,7 @@
  */
 import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus, FactAttribution,
-  NewFact, FactListOpts, FactsHealth,
+  NewFact, FactListOpts, RecallFactReadOpts, FactsHealth,
 } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import { tryParseEmbedding } from '../utils.ts';
@@ -28,7 +28,9 @@ import type { LegacyUnscopedRead } from './brands.ts';
 import { sqlFragment, trustedSql } from './fragment.ts';
 import { compileRowNormalizer } from './normalize.ts';
 import { projectionEligibleSql } from '../eligibility/sql.ts';
-import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
+import { FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING } from '../facts/insert-guard-schema.ts';
+import { privateProvenanceFilterUnderPolicy } from '../search/private-visibility.ts';
+import { factVisibilitySql, onOwnedMemoryPageSql } from '../access/member-facts.ts';
 import { storedTrustTier } from '../trust/tier.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 
@@ -56,12 +58,31 @@ function eligibilityClause(opts: FactListOpts | undefined) {
   return opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('facts', 'facts', opts.eligibility))}` : sqlFragment``;
 }
 
+/** GST-359 C2: a visibility list, widened only to the caller's own member-page private facts (access/member-facts.ts). */
+function visibilityClause(visibility: readonly string[] | null) {
+  return visibility ? sqlFragment`AND ${trustedSql(factVisibilitySql('facts', visibility))}` : sqlFragment``;
+}
+
 function privacyClause(opts: { excludePrivate?: boolean } | undefined) {
-  return opts?.excludePrivate ? sqlFragment` AND ${trustedSql(privateProvenanceFilterFragment('facts'))}` : sqlFragment``;
+  return opts?.excludePrivate ? sqlFragment` AND ${trustedSql(privateProvenanceFilterUnderPolicy('facts'))}` : sqlFragment``;
 }
 
 function grepPattern(opts: FactListOpts | undefined): string | null {
   return (opts?.grep && opts.grep.trim()) ? '%' + escapeLikePattern(opts.grep.trim()) + '%' : null;
+}
+
+/**
+ * The pre-LIMIT narrowing both recall cursor reads apply (listFactsSince and,
+ * for --since-last-run paging, listFactsKeyset): entity, the page the fact sits
+ * on (memory_recall's own-member-page arm), session, audit rows and --grep. Each part is opt-in, so a caller passing none (delta) gets none.
+ */
+function recallNarrowing(opts: RecallFactReadOpts | undefined) {
+  const grep = grepPattern(opts);
+  return sqlFragment`${opts?.entitySlug != null ? sqlFragment` AND entity_slug = ${opts.entitySlug}` : sqlFragment``}${
+    opts?.sourceMarkdownSlug != null ? sqlFragment` AND source_markdown_slug = ${opts.sourceMarkdownSlug}` : sqlFragment``}${
+    opts?.sessionId ? sqlFragment` AND source_session = ${opts.sessionId}` : sqlFragment``}${
+    opts?.excludeAuditRows ? sqlFragment` AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sqlFragment``}${
+    grep ? sqlFragment` AND fact ILIKE ${grep} ESCAPE '\\'` : sqlFragment``}`;
 }
 
 export async function insertFact(
@@ -114,7 +135,8 @@ export async function insertFact(
           ) RETURNING id
         `)).rows;
         const id = Number(ins[0].id);
-        (await tx.run(sqlFragment`UPDATE facts SET expired_at = now(), superseded_by = ${id}
+        (await tx.run(sqlFragment`UPDATE facts SET expired_at = now(), superseded_by = ${id},
+                   valid_until = CASE WHEN valid_from < ${validFrom}::timestamptz AND (valid_until IS NULL OR valid_until > ${validFrom}::timestamptz) THEN ${validFrom}::timestamptz ELSE valid_until END
                  WHERE id = ${supersedeId} AND expired_at IS NULL`)).rows;
         return id;
       });
@@ -171,11 +193,15 @@ const wellFormed = <T extends string | null | undefined>(s: T): T => (typeof s =
  * #6574: inserts fact rows in chunks of FACT_INSERT_CHUNK with one statement
  * each. Returns each input's new id, aligned to `rows`, or null when the v51
  * ON CONFLICT DO NOTHING skipped it; within a chunk the first input for a
- * (slug, row_num) wins, as the per-row loop's order did.
+ * (slug, row_num) wins, as the per-row loop's order did. The inserts run
+ * under FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING, so a withdrawn row is stamped
+ * once per statement by facts_guard_inserted instead of by a per-row trigger
+ * call (#7105); the RETURNING below reads no stamped column.
  */
 async function insertFactRows(tx: SqlExecutor, castSuffix: EmbeddingCast,
   rows: ReadonlyArray<NewFact & { row_num: number; source_markdown_slug: string }>, sourceId: string): Promise<Array<number | null>> {
   const rowIds: Array<number | null> = [];
+  (await tx.run(sqlFragment`SELECT set_config(${FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING}, 'on', true)`)).rows;
   for (let at = 0; at < rows.length; at += FACT_INSERT_CHUNK) {
     const chunk = rows.slice(at, at + FACT_INSERT_CHUNK).map((input, ord) => {
       const embedding = input.embedding ?? null;
@@ -227,6 +253,7 @@ async function insertFactRows(tx: SqlExecutor, castSuffix: EmbeddingCast,
     }
     for (const input of chunk) rowIds.push(byKey.get(factRowKey(input.source_markdown_slug, input.row_num ?? null))?.shift() ?? null);
   }
+  (await tx.run(sqlFragment`SELECT set_config(${FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING}, '', true)`)).rows;
   return rowIds;
 }
 
@@ -396,11 +423,11 @@ export async function listFactsByEntity(
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
-        AND entity_slug = ${entitySlug}
+        AND entity_slug = ${entitySlug}${opts?.sessionId ? sqlFragment` AND source_session = ${opts.sessionId}` : sqlFragment``}
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
         ${unconsolidatedOnly ? sqlFragment`AND consolidated_at IS NULL` : sqlFragment``}
         ${kinds ? sqlFragment`AND kind = ANY(${kinds}::text[])` : sqlFragment``}
-        ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}
+        ${visibilityClause(visibility)}${privacyClause(opts)}
         ${excludeAuditRows ? sqlFragment`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sqlFragment``}
         ${grepPat ? sqlFragment`AND fact ILIKE ${grepPat} ESCAPE '\\'` : sqlFragment``}${eligibilityClause(opts)}
       ORDER BY valid_from DESC, id DESC
@@ -413,7 +440,7 @@ export async function listFactsSince(
   exec: LegacyUnscopedRead,
     source_id: string,
     since: Date,
-    opts?: FactListOpts & { entitySlug?: string; sessionId?: string },
+    opts?: RecallFactReadOpts,
   ): Promise<FactRow[]> {
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
@@ -421,23 +448,15 @@ export async function listFactsSince(
     const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
-    const entitySlug = opts?.entitySlug ?? null;
-    const sessionId = opts?.sessionId ?? null;
     const eventTime = opts?.eventTime === true;
-    const excludeAuditRows = opts?.excludeAuditRows === true;
-    const grepPat = grepPattern(opts);
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
       SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``} FROM facts
       WHERE source_id = ${source_id}
-        AND ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} >= ${since}
-        ${entitySlug != null ? sqlFragment`AND entity_slug = ${entitySlug}` : sqlFragment``}
-        ${sessionId ? sqlFragment`AND source_session = ${sessionId}` : sqlFragment``}
+        AND ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} >= ${since}${recallNarrowing(opts)}
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
         ${unconsolidatedOnly ? sqlFragment`AND consolidated_at IS NULL` : sqlFragment``}
         ${kinds ? sqlFragment`AND kind = ANY(${kinds}::text[])` : sqlFragment``}
-        ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}
-        ${excludeAuditRows ? sqlFragment`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sqlFragment``}
-        ${grepPat ? sqlFragment`AND fact ILIKE ${grepPat} ESCAPE '\\'` : sqlFragment``}${eligibilityClause(opts)}
+        ${visibilityClause(visibility)}${privacyClause(opts)}${eligibilityClause(opts)}
       ORDER BY ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `)).rows;
@@ -459,7 +478,7 @@ export async function listFactsKeyset(
   exec: LegacyUnscopedRead,
   source_id: string,
   after: { createdAt: string; id: number | null } | null,
-  opts?: FactListOpts,
+  opts?: RecallFactReadOpts,
 ): Promise<FactRow[]> {
   const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
   const activeOnly = opts?.activeOnly !== false;
@@ -474,9 +493,9 @@ export async function listFactsKeyset(
            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso
     FROM facts
     WHERE source_id = ${source_id}
-      ${afterCondition}
+      ${afterCondition}${recallNarrowing(opts)}
       ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
-      ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}${eligibilityClause(opts)}
+      ${visibilityClause(visibility)}${privacyClause(opts)}${eligibilityClause(opts)}
     ORDER BY created_at ASC, id ASC
     LIMIT ${limit}
   `)).rows;
@@ -504,7 +523,7 @@ export async function listFactsBySession(
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
         ${unconsolidatedOnly ? sqlFragment`AND consolidated_at IS NULL` : sqlFragment``}
         ${kinds ? sqlFragment`AND kind = ANY(${kinds}::text[])` : sqlFragment``}
-        ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}
+        ${visibilityClause(visibility)}${privacyClause(opts)}
         ${excludeAuditRows ? sqlFragment`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sqlFragment``}
         ${grepPat ? sqlFragment`AND fact ILIKE ${grepPat} ESCAPE '\\'` : sqlFragment``}${eligibilityClause(opts)}
       ORDER BY created_at DESC, id DESC
@@ -532,7 +551,7 @@ export async function listSupersessions(
       WHERE source_id = ${source_id}
         AND superseded_by IS NOT NULL
         ${since ? sqlFragment`AND COALESCE(expired_at, valid_until) >= ${since}` : sqlFragment``}
-        ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}${opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('facts', 'facts', opts.eligibility))}` : sqlFragment``}
+        ${visibilityClause(visibility)}${privacyClause(opts)}${opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('facts', 'facts', opts.eligibility))}` : sqlFragment``}
       ORDER BY COALESCE(expired_at, valid_until) DESC, id DESC
       LIMIT ${limit}
     `)).rows;
@@ -563,12 +582,14 @@ export async function findCandidateDuplicates(
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null; excludeMemberPages?: boolean; onlyPage?: string },
   ): Promise<FactRow[]> {
     const k = Math.min(Math.max(opts?.k ?? 5, 1), 20);
     const speaker = opts?.attributedTo
       ? sqlFragment`AND (attributed_to IS NULL OR attributed_to = ${opts.attributedTo})`
       : sqlFragment``;
+    const members = opts?.onlyPage ? sqlFragment` AND source_markdown_slug = ${opts.onlyPage}`
+      : opts?.excludeMemberPages ? sqlFragment` AND NOT ${trustedSql(onOwnedMemoryPageSql('facts'))}` : sqlFragment``;
     // Validity-lapsed rows are not dedup candidates: a re-stated fact after
     // its valid_until lapses re-inserts fresh (WP5 read-time TTL honesty).
     if (opts?.arm === 'keyword') return findKeywordCandidates(exec, source_id, entitySlug, factText, k, opts);
@@ -585,7 +606,7 @@ export async function findCandidateDuplicates(
           AND embedding_model=${opts.embeddingModel} AND embedded_text_hash=md5(fact)
           AND vector_dims(embedding)=${opts.embedding.length}
           AND source != ALL(${AUDIT_ROW_SOURCES}::text[])
-          ${speaker}
+          ${speaker}${members}
         ORDER BY embedding <=> ${trustedSql(vectorLiteralSql(lit, '::vector'))}
         LIMIT ${k}
       `)).rows;
@@ -597,7 +618,7 @@ export async function findCandidateDuplicates(
         AND entity_slug = ${entitySlug}
         AND expired_at IS NULL
         AND (valid_until IS NULL OR valid_until > now())
-        ${speaker}
+        ${speaker}${members}
       ORDER BY created_at DESC, id DESC
       LIMIT ${k}
     `)).rows;
@@ -616,7 +637,7 @@ export async function findCandidateDuplicates(
  */
 async function findKeywordCandidates(
   exec: LegacyUnscopedRead, source_id: string, entitySlug: string, factText: string, k: number,
-  opts: { embedding?: Float32Array; embeddingModel?: string | null; attributedTo?: FactAttribution | null },
+  opts: { embedding?: Float32Array; embeddingModel?: string | null; attributedTo?: FactAttribution | null; excludeMemberPages?: boolean; onlyPage?: string },
 ): Promise<FactRow[]> {
   if (opts.embedding && !opts.embeddingModel) return [];
   const speaker = opts.attributedTo
@@ -636,7 +657,7 @@ async function findKeywordCandidates(
         AND (f.valid_until IS NULL OR f.valid_until > now())
         AND f.source != ALL(${AUDIT_ROW_SOURCES}::text[])
         ${comparable}
-        ${speaker}
+        ${speaker}${opts.onlyPage ? sqlFragment` AND f.source_markdown_slug = ${opts.onlyPage}` : opts.excludeMemberPages ? sqlFragment` AND NOT ${trustedSql(onOwnedMemoryPageSql('f'))}` : sqlFragment``}
         AND q.q IS NOT NULL AND to_tsvector(${lang}::regconfig, f.fact) @@ q.q
       ORDER BY ts_rank_cd(to_tsvector(${lang}::regconfig, f.fact), q.q) DESC, f.created_at DESC, f.id DESC
       LIMIT ${k}
@@ -690,7 +711,8 @@ export async function findTrajectory(exec: LegacyUnscopedRead, opts: import('../
       WHERE ${useArray ? sqlFragment`source_id = ANY(${sourceIds}::text[])` : sqlFragment`source_id = ${sourceId}`}
         AND entity_slug = ${opts.entitySlug}
         AND expired_at IS NULL
-        ${remoteFilter ? sqlFragment`AND visibility = 'world'` : sqlFragment``}${privacyClause(opts)}
+        ${remoteFilter ? visibilityClause(['world']) : sqlFragment``}${privacyClause(opts)}
+        AND ${trustedSql(projectionEligibleSql('facts', 'facts', undefined))}
         ${metric !== null ? sqlFragment`AND claim_metric = ${metric}` : sqlFragment``}
         ${kind === 'metric' ? sqlFragment`AND claim_metric IS NOT NULL` : sqlFragment``}
         ${kind === 'event' ? sqlFragment`AND event_type IS NOT NULL` : sqlFragment``}
@@ -790,6 +812,10 @@ export interface FactRowSqlShape {
   attributed_to?: FactAttribution | null;
   trust_tier?: string | null;
   write_origin?: unknown;
+  claim_metric?: string | null;
+  claim_value?: number | string | null;
+  claim_unit?: string | null;
+  claim_period?: string | null;
 }
 
 function originRecord(value: unknown): Record<string, unknown> | null {
@@ -851,6 +877,10 @@ export function rowToFact(raw: FactRowSqlShape): FactRow {
     ...(row.attributed_to ? { attributed_to: row.attributed_to } : {}),
     ...(row.trust_tier ? { trust_tier: storedTrustTier(row.trust_tier) } : {}),
     ...(row.write_origin !== undefined ? { write_origin: originRecord(row.write_origin) } : {}),
+    ...(row.claim_metric ? { claim_metric: row.claim_metric } : {}),
+    ...(row.claim_value != null ? { claim_value: Number(row.claim_value) } : {}),
+    ...(row.claim_unit ? { claim_unit: row.claim_unit } : {}),
+    ...(row.claim_period ? { claim_period: row.claim_period } : {}),
   };
 }
 

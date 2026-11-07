@@ -27,6 +27,7 @@ import {
   HOOK_EVENTS,
   type HookHeartbeatEntry,
 } from '../src/commands/hook.ts';
+import { writeHeartbeat } from '../src/core/context/hook-heartbeat.ts';
 import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
 import {
   ensureIpcSecret,
@@ -103,6 +104,8 @@ async function startServer(opts: {
   secretOverride?: string;
   boundSourceId?: string;
   onRequest?: (req: TurnContextRequest) => void;
+  /** Answer only after this long, so the serve's backstop answers first. */
+  hangMs?: number;
 }): Promise<void> {
   mkdirSync(opts.dataDir, { recursive: true });
   const secret = opts.secretOverride ?? ensureIpcSecret(opts.dataDir);
@@ -113,6 +116,7 @@ async function startServer(opts: {
       resolve: async () => null,
       turn_context: async (req) => {
         opts.onRequest?.(req);
+        if (opts.hangMs) await new Promise((r) => setTimeout(r, opts.hangMs));
         if (opts.blockText == null) return null;
         return { text: opts.blockText, pointers: [], factsCount: 0 };
       },
@@ -195,6 +199,19 @@ describe('user-prompt source routing (#5941)', () => {
     expect(out.get()).not.toContain('OTHER-SOURCE-CONTEXT');
     expect((await lastHeartbeat())?.reason).toBe('source_mismatch');
   });
+});
+
+describe('serve backstop (GBRA-95 row)', () => {
+  test('a turn_context cut short by the serve backstop records a degraded server_budget heartbeat, never a silent ok', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'LATE-CONTEXT', hangMs: 3000 });
+    const out = collectStdout();
+    await runHook(['user-prompt', '--harness', 'codex'], { ...out.io, userPromptDeadlineMs: 2000, stdin: JSON.stringify({ prompt: 'hello Acme', cwd: tmp }) });
+    expect(out.get()).not.toContain('LATE-CONTEXT');
+    const hb = await lastHeartbeat();
+    expect({ outcome: hb?.outcome, reason: hb?.reason }).toEqual({ outcome: 'degraded', reason: 'server_budget' });
+  }, 10_000);
 });
 
 describe('dispatch', () => {
@@ -596,6 +613,32 @@ describe('user-prompt', () => {
     expect(hb?.turns).toBe(1);
   });
 
+  // #6739: Claude Code creates projects/<project>/ only after the first
+  // prompt in a new working folder, so the first user-prompt hook there sees
+  // a transcript whose PARENT folder is missing too. It is the same absent
+  // transcript as #5465 and must not record transcript_unreadable.
+  test('#6739: a transcript whose project folder does not exist yet delivers prompt-only context', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'CTX: new-folder context' });
+    const projectsRoot = join(tmp, 'projects-root-6739');
+    mkdirSync(projectsRoot, { recursive: true });
+    const absent = join(projectsRoot, '-home-alice-example-new-project', 'fresh-session.jsonl');
+    const out = collectStdout();
+    expect(
+      await runHook(['user-prompt'], {
+        ...out.io,
+        stdin: JSON.stringify({ prompt: 'first prompt in a new folder', transcript_path: absent }),
+        transcriptRoot: projectsRoot,
+      }),
+    ).toBe(0);
+    const parsed = JSON.parse(out.get().trim());
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('CTX: new-folder context');
+    const hb = await lastHeartbeat();
+    expect(hb?.outcome).toBe('ok');
+    expect(hb?.reason).not.toBe('transcript_unreadable');
+  });
+
   test('unauthorized (server holds a different secret) degrades cleanly', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);
@@ -987,6 +1030,26 @@ describe('session-end', () => {
     expect(existsSync(spooled('sess-drift.txt'))).toBe(false);
   });
 
+  test('a Claude Code session with only slash commands is empty_session, not parser_drift', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'empty.jsonl', [
+      JSON.stringify({ type: 'permission-mode', permissionMode: 'default', sessionId: 'sess-empty' }),
+      JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: '<system-reminder>session renamed</system-reminder>' } }),
+      JSON.stringify({ type: 'system', subtype: 'local_command', content: '<command-name>/rename</command-name>' }),
+      JSON.stringify({ type: 'cost-state', sessionId: 'sess-empty' }),
+    ]);
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-empty', transcript_path: transcript, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const hb = await lastHeartbeat();
+    expect(hb?.reason).toBe('empty_session');
+    expect(hb?.outcome).not.toBe('error');
+    expect(existsSync(await hookStatusPath())).toBe(false);
+  });
+
   test('confinement rejection: degraded heartbeat, no corpus write [S3#8]', async () => {
     const outside = join(tmp, 'outside.jsonl');
     writeFileSync(outside, userLine('outside content') + '\n');
@@ -1061,6 +1124,17 @@ describe('heartbeat', () => {
     expect(JSON.parse(lines[lines.length - 1]).event).toBe('stop');
   });
 
+  test('#6794: every allowlisted key round-trips through writeHeartbeat', async () => {
+    const entry: Record<string, string | number> = {};
+    HEARTBEAT_ALLOWED_KEYS.forEach((key, i) => {
+      entry[key] = key === 'outcome' ? 'ok' : key === 'duration_ms' ? i : `v-${key}`;
+    });
+    await writeHeartbeat(entry as unknown as HookHeartbeatEntry);
+    const [written] = await readHeartbeatTail(1);
+    expect(Object.keys(written).sort()).toEqual([...HEARTBEAT_ALLOWED_KEYS].sort());
+    expect(written).toEqual(entry as unknown as HookHeartbeatEntry);
+  });
+
   test('readHeartbeatTail returns the last n entries oldest→newest', async () => {
     const p = await heartbeatPath();
     const mk = (i: number) => JSON.stringify({ ts: `t${i}`, event: 'stop', outcome: 'ok', duration_ms: i });
@@ -1120,6 +1194,23 @@ function markRepoPhaseComplete(repo: string): void {
     created_paths: [],
     registrations: [],
     repo_url: repoUrl,
+  } as RepoReceipt);
+}
+
+/** #8427: the bootstrap install receipt names this workspace, as bootstrap writes it when it wires the hooks, before any repo phase. */
+function markBootstrapped(repo: string): void {
+  const toplevel = execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  mkdirSync(join(home(), 'bootstrap'), { recursive: true });
+  writeReceipt(home(), {
+    receipt_version: 1,
+    workspace_dir: toplevel,
+    source_id: 'workspace',
+    agent_name: 'test-agent',
+    created_at: '2026-01-01T00:00:00.000Z',
+    created_by: 'test',
+    brain_created_by_bootstrap: false,
+    created_paths: [],
+    registrations: [],
   } as RepoReceipt);
 }
 
@@ -1217,6 +1308,7 @@ describe('bootstrap push gate [G4]', () => {
     initGitRepoWithDirtyTree(repo);
     writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
     // NB: no markRepoPhaseComplete — the repo phase has not run yet.
+    markBootstrapped(repo);
     const spawned: string[] = [];
     const out = collectStdout();
     await runHook(['session-start'], {
@@ -1233,6 +1325,7 @@ describe('bootstrap push gate [G4]', () => {
     const repo = join(tmp, 'boot-repo-pending-end');
     initGitRepoWithDirtyTree(repo);
     writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    markBootstrapped(repo);
     const spawned: string[] = [];
     await runHook(['session-end'], {
       write: () => {},
@@ -1263,6 +1356,7 @@ function bootRepo(name: string, opts: { repoPhase?: boolean; clean?: boolean } =
   initGitRepoWithDirtyTree(repo);
   writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
   if (opts.repoPhase !== false) markRepoPhaseComplete(repo);
+  else markBootstrapped(repo);
   if (opts.clean) {
     execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' });
     execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { stdio: 'ignore' });
@@ -1332,6 +1426,39 @@ describe('stop-hook per-turn push [D3]', () => {
     await runHook(['stop'], stopIo(repo, spawned));
     expect(spawned).toEqual([]);
     expect((await lastHeartbeat())?.reason).toBe('push_disabled');
+  });
+
+  /** #8427: a core.fsmonitor command planted in the checkout's .git/config; git status would run it. */
+  function plantFsmonitor(repo: string): string {
+    const name = repo.split('/').pop()!;
+    const marker = join(tmp, `${name}-FSMONITOR_RAN`);
+    const hook = join(tmp, `${name}-fsmonitor.sh`);
+    writeFileSync(hook, `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\n`, { mode: 0o755 });
+    execFileSync('git', ['-C', repo, 'config', 'core.fsmonitor', hook]);
+    return marker;
+  }
+
+  test('#8427: the per-turn push probe in the bootstrapped workspace never runs a planted core.fsmonitor', async () => {
+    const repo = bootRepo('stop-fsmonitor');
+    const marker = plantFsmonitor(repo);
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test('#8427: a checkout the install receipt does not name runs no git, even with an initialized agent.json', async () => {
+    bootRepo('stop-fsmonitor-receipt');
+    const repo = join(tmp, 'stop-fsmonitor-planted');
+    initGitRepoWithDirtyTree(repo);
+    writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    const marker = plantFsmonitor(repo);
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect((await lastHeartbeat())?.reason).toBe('push_skipped_not_bootstrap');
+    await runHook(['session-start'], { write: () => {}, spawnPush: (root: string) => { spawned.push(root); }, stdin: '', cwd: repo });
+    expect(spawned).toEqual([]);
+    expect(existsSync(marker)).toBe(false);
   });
 
   test('non-bootstrap git repo: never spawns (same security boundary as session-end)', async () => {
@@ -1442,8 +1569,9 @@ describe('stop-hook per-turn push [D3]', () => {
     await runHook(['stop'], stopIo(a, spawned));
     expect(spawned).toHaveLength(1);
     await runHook(['stop'], stopIo(b, spawned));
-    expect(spawned).toHaveLength(1); // b defers (no receipt binding) — and does NOT clobber a's state
-    expect((await lastHeartbeat())?.reason).toBe('push_deferred_repo_pending');
+    expect(spawned).toHaveLength(1); // b is not the receipt's workspace — and does NOT clobber a's state
+    // #8427: a workspace the receipt does not name is not gbrain's, so no git runs there at all.
+    expect((await lastHeartbeat())?.reason).toBe('push_skipped_not_bootstrap');
     await runHook(['stop'], stopIo(a, spawned));
     expect(spawned).toHaveLength(1); // a still debounced — b's activity didn't reset a
     expect((await lastHeartbeat())?.reason).toBe('push_debounced');

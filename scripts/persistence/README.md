@@ -217,7 +217,7 @@ never a connection URL. Keep the retained directory private: its original
 the diagnostic manifest. Successful runs retain no fixtures.
 
 `persistence-validation.yml` runs the full gate on Linux x64 for both engines
-under Bun 1.4.0 and 1.4.2 and uploads every manifest. Native OS/architecture
+under Bun 1.4.4 and uploads every manifest. Native OS/architecture
 coverage is separately required by `native-locks.yml`; its configured matrix
 must not be mistaken for locally executed runtime evidence.
 
@@ -296,7 +296,7 @@ PGLite keeps the original in-memory read-latency storage model; the separate
 recorded as `full_gate: false`. `tests/heavy/read_latency_under_sync.sh`
 retains its optional `STRICT_LATENCY=1` interface and now runs the same
 three-sample harness; sample validity always fails closed. CI passes
-`--informational` on both Bun versions and both engines: a valid workload
+`--informational` on every supported Bun version and both engines: a valid workload
 over the 50% threshold exits successfully, but the manifest keeps its
 `verdict: "fail"`, `status: "failed"` and `full_gate: false` threshold result.
 Invalid samples, failed reads/writes and insufficient overlap still fail CI.
@@ -316,9 +316,11 @@ revision and disclose skipped cells.
 on PGLite and, with an explicit safe `DATABASE_URL`, isolated PostgreSQL databases.
 It covers stale preconditions, current/original grants, private facts, retained
 backups, ordinary mutations after repair, and competing publications.
-`test/reconcile-owner-journey.serial.test.ts` drives real CLI requests through
-HTTP and stdio PGLite owners before and after activation, restarts the owner, and
-independently reads the newly remembered private fact and provenance.
+`test/reconcile-owner-journey.serial.test.ts` (stdio) and
+`test/reconcile-owner-journey-http.serial.test.ts` (HTTP) drive real CLI requests
+through PGLite owners before and after activation, restart the owner, and
+independently read the newly remembered private fact and provenance
+(`test/helpers/reconcile-owner-journey.ts`).
 
 `test/reconcile-crash-*.slow.test.ts` and `test/e2e/reconcile-crash*.test.ts` kill real
 processes at all eight publication boundaries with activation off/on. PostgreSQL
@@ -326,8 +328,8 @@ uses one file per activation state to stay within the unchanged per-file cap. Op
 `GBRAIN_TEST_RECONCILE_CRASH_MANIFEST_DIR` retains executed-case evidence.
 `test/e2e/reconcile-pgbouncer.test.ts` requires the transaction-mode pooler when
 `GBRAIN_CI_REQUIRE_PGBOUNCER=1` and proves repair followed by a new private memory
-write. The durable-persistence workflow runs these contracts on both supported
-Bun versions and uploads the crash manifests; local CI runs the slow and E2E lanes.
+write. The durable-persistence workflow runs these contracts on every supported
+Bun version and uploads the crash manifests; local CI runs the slow and E2E lanes.
 
 `test/put-page-persistence.test.ts` and `test/e2e/put-page-persistence-postgres.test.ts`
 pin durable page acceptance and ordinary-error publication: native contention
@@ -514,7 +516,7 @@ boundaries, followed by a small multi-process soak. The Postgres test creates
 and drops fresh test databases, requiring CREATEDB on the explicit test URL.
 It never truncates the shared E2E database. The reusable
 `persistence-validation.yml` gate runs 1,000 schedules and 10,000 writes per
-engine under Bun 1.4.0 and 1.4.2 and uploads actual executed-case manifests;
+engine under Bun 1.4.4 and uploads actual executed-case manifests;
 the sections above cover workloads, reruns, performance measurements and the
 process-crash scope.
 
@@ -526,10 +528,10 @@ reserved short control capacity while bulk connections remain held, then
 drains and commits the original request. Ownership cases cover mismatched
 successor manifests, stale owners, root replacement under a held kernel
 lock, and actual source deletion/recreation. The reusable persistence lane
-runs this matrix on both supported Bun versions and uploads its manifest.
+runs this matrix on every supported Bun version and uploads its manifest.
 
 The required persistence lane also runs `scripts/persistence/performance.ts`
-on both engines and Bun versions. Three independent instances use the
+on both engines and every supported Bun version. Three independent instances use the
 existing 500-page/200-query read-latency corpus, with public `put_page`
 mutations and actual in-flight interval coverage of at least 90%. Any read
 or write failure invalidates the sample. CI uses `--informational`: the 50%
@@ -561,16 +563,16 @@ The chaos modes, each named in failures and selectable with
 
 | Mode | What happens | Expected end state | On master |
 | --- | --- | --- | --- |
-| (a) client kills, (b) serve kills | A kill loop of `GBRAIN_TEST_CONVERGENCE_KILLS` change rounds, each ending in one `kill -9` at a point of the curated list (`publication:before_commit`, `publication:after_commit`, `consumer:preparing`, `lane:applied`, `sync:before_group_admission`, `sync:mid_checkpoint`), cycling a `--no-delegate` client, a serve running a delegated catch-up, and a serve with its delegating client | strict convergence | runs |
+| (a) client kills, (b) serve kills | A kill loop of `GBRAIN_TEST_CONVERGENCE_KILLS` change rounds, each ending in one `kill -9` at a point of the curated list (`publication:before_commit`, `publication:after_commit`, `consumer:preparing`, `lane:applied`, `sync:before_group_admission`, `sync:mid_checkpoint`, `sync:held_settled`, `sync:passed_over`, `sync:batch_entries`, `sync:tail_started`), cycling a `--no-delegate` client, a serve running a delegated catch-up, and a serve with its delegating client | strict convergence | runs |
 | (c) concurrent writers | During the kill loop: `gbrain put` rewrites of 5% of the notes, `remember` facts on an entity page, `gbrain extract timeline --source db` (a managed maintenance job) | strict convergence; every acknowledged write in the ledger | runs |
 | (c-db) DB-only competitor | With `sync.write_through=false`, a DB-only `put` lands while the run is stalled on that page's frozen entry, and another on a page whose file did not change | the raced page is held `concurrent_write` (needs a person), its file keeps the committed bytes and its page the DB write; both pages are left out of disk == DB | runs |
 | (d) out-of-band Git | While a run is stalled mid-manifest: `git mv` and `git rm` of 1% of the files, committed, and deletion of 1% uncommitted | moves and removals converge strictly; each uncommitted deletion is listed by `gbrain pages ghosts` with the `gbrain repair ghost-pages` exit and left out of disk == DB | runs |
-| (e) mid-run edit | The `sync:after_freeze` hook writes an uncommitted edit to a seeded entry after it was frozen | the run's receipt and `sync status` name `worktree_dirty`; after the editor commits, strict convergence | skipped until PR 1 of #6712: no `worktree_dirty` hold is named, and the run churns through `source_changed` conflicts and cancellations (5 of 20 entries after 150 s) |
-| (f) pooler drop | Every pooled connection drops at the proxy after 20 committed pages of a bulk run (`GBRAIN_TEST_CONVERGENCE_PGBOUNCER_CONTAINER=<name>` restarts that container instead) | no new hold; the drain resumes within the owner-kill stall bound; strict convergence | skipped until PR 1 of #6712: it converges with no hold, but publication stalls 356 s (a publication lease) after the drop |
+| (e) mid-run edit | The `sync:after_freeze` hook writes an uncommitted edit to a seeded entry after it was frozen | the run's receipt and `sync status` name `worktree_dirty`; after the editor commits, strict convergence | runs (turned on by PR 1 of #6712) |
+| (f) pooler drop | Every pooled connection drops at the proxy after 20 committed pages of a bulk run (`GBRAIN_TEST_CONVERGENCE_PGBOUNCER_CONTAINER=<name>` restarts that container instead) | no new hold; the drain resumes within the owner-kill stall bound; strict convergence | runs (turned on by PR 2 of #6712: a pass whose connection died releases its unpublished claims once the database answers, instead of holding them under the publication lease) |
 | (g) two drainers | `sync --all --no-delegate` beside a serve draining a delegated sync of the same source | strict convergence | runs |
 | (lease) drain-lease takeover | A `--no-delegate` leader stalls right after it takes the source's drain lease (`sync:lease_acquired`), two `--no-delegate` followers queue behind it, and the leader is SIGKILLed | a follower reports following, one takes over inside the lease TTL (2 min) and finishes `synced`, no follower ends `blocked`; strict convergence | runs (#6712 PR 1) |
-| (knock-on) | One page's publication throws P0001 once inside a bulk group, then a trigger refuses one page with P0001 for a whole run | no other page of the run is cancelled; strict convergence once the trigger is gone | skipped until PR 1 of #6712: the one-shot throw is retried and cancels nothing, but the refused page cancels the run's other 74 requests, and both plain syncs after the trigger is dropped stop `blocked_by_failures` on the frozen `storage_error` request until `--retry-failed` |
-| (systemic) | A trigger on `pages` raises an unregistered P0001 (one scenario) or 55000 (another) on every page write for one run, then is dropped | the refused run does not report success and its receipt names the SQLSTATE; strict convergence once the trigger is gone | skipped until PR 1 of #6712: the refused run stops `blocked` naming the SQLSTATE, but both plain syncs after the trigger is dropped stay `blocked_by_failures` until `--retry-failed` |
+| (knock-on) | One page's publication throws P0001 once inside a bulk group, then a trigger refuses one page with P0001 for a whole run | no other page of the run is cancelled; strict convergence once the trigger is gone | runs (turned on by PR 1 of #6712) |
+| (systemic) | A trigger on `pages` raises an unregistered P0001 (one scenario) or 55000 (another) on every page write for one run, then is dropped | the refused run does not report success and its receipt names the SQLSTATE; strict convergence once the trigger is gone | runs (turned on by PR 1 of #6712) |
 
 A skipped mode stays written; naming it in `GBRAIN_TEST_CONVERGENCE_MODES` runs it
 anyway, which is how the PR that fixes it turns it on.
@@ -639,7 +641,7 @@ every mode not skipped), `NOTES` (default 200; the large page is always there),
 client, serve and writer log per scenario) and `PGBOUNCER_CONTAINER` (mode (f)).
 
 CI: the `convergence` job of `.github/workflows/persistence-validation.yml`, on
-both supported Bun versions with the deployment matrix's pgvector and
+every supported Bun version with the deployment matrix's pgvector and
 transaction-mode PgBouncer services. Pull requests run it when
 `scripts/ci-convergence-scope.sh` selects their diff (persistence, sync,
 projections, storage, the harness and its workflow; never `package.json`

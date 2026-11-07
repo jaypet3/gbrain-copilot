@@ -16,7 +16,7 @@ Normative design docs: [AGENT_BOOTSTRAP_DESIGN.md](../designs/AGENT_BOOTSTRAP_DE
 (scope) and [AGENT_BOOTSTRAP_PLAN.md](../designs/AGENT_BOOTSTRAP_PLAN.md)
 (implementation). The paste block lives in the README; the runbook your agent
 follows is `BOOTSTRAP_FOR_AGENTS.md` at the repo root, fetched at the
-`latest-stable` ref.
+`stable` ref.
 
 ## What gets installed, exactly
 
@@ -134,8 +134,9 @@ a kill switch (`gbrain config set facts.extraction_enabled false`).
 
 ## Security posture
 
-- **Supply chain:** the paste block and install command pin the `latest-stable`
-  ref — a maintainer-controlled tag advanced only after a release fully publishes.
+- **Supply chain:** the paste block and install command pin the `stable`
+  ref — a maintainer-controlled tag moved only to a published release whose exact
+  tree passed the production soak.
   The runbook carries a version stamp; `bootstrap status` warns on skew. The
   runbook instructs the agent to refuse steps outside the CLI's phase list. bun
   installs via package manager or checksum-verified download.
@@ -329,6 +330,30 @@ reports `"status": "partial"` and exits 1. A serve that holds the brain but
 doesn't answer at the URL you gave (a wrong `--url` or `--port`), anything
 else answering there, a run without `--token`, and a Postgres brain all still
 fail the health check with exit 1.
+
+<a id="cleanup-pending"></a>Each rotation leaves the old shared-skills
+enrollment with that enrollment's own credential, then revokes the
+credential: leave before revoke, because `leave_brain` is principal-owned and
+a revoked token can never leave. Each carried token id is revoked and cleared
+on its own, so one stuck enrollment no longer holds every other id on the
+receipt. An enrollment whose credential is already revoked (for example,
+revoked by hand before its leave finished) is inert: the run still removes it
+locally (adapter receipt, native router, unchanged owned files; edited files
+are retained) and records it as left with reason `credential_revoked`.
+
+While anything is still pending, the run exits `bootstrap_cleanup_pending`
+(exit 14, `"status": "cleanup_pending"` under `--json`) instead of 0. The
+JSON `cleanup` array lists each id with its token state (`active`,
+`revoked`, `missing`, `unknown`), its cleanup state (`revoke_pending`,
+`leave_pending`, `enrollment_retained`, `credential_unreadable`) and whether
+a re-run can finish it. When every id can, the `fix` re-runs the same command
+(`next: run`). When one cannot, the `fix` is the owner's step
+(`next: tell_user_to_run`): for a lost cleanup credential, restore it or
+revoke that token by id, after which the next re-run finishes the local
+cleanup; for an old enrollment kept because the current one is not ready,
+resolve the current enrollment first. `--status` exits 14 with the same list,
+and doctor's `bootstrap_harness_health` names each id as revoked (cleanup
+pending) or active.
 
 Postgres brains mint fine while the serve runs. A token you supply is never
 revoked by `--remove` or rotation (it is not the harness's to revoke) —

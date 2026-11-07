@@ -46,7 +46,7 @@ import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, un
 import { dirname, join } from 'node:path';
 import { execFileSync } from './spawn.ts';
 import { createHash } from 'node:crypto';
-import { RELEASES_API_URL } from './repo-coordinates.ts';
+import { RELEASES_API_BASE, RELEASES_API_URL } from './repo-coordinates.ts';
 
 /**
  * The attestation's builder id must be EXACTLY one of these — it binds the
@@ -157,8 +157,17 @@ export interface BinarySelfUpdateDeps {
 }
 
 async function defaultFetchRelease(): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+  return fetchReleaseJson(RELEASES_API_URL);
+}
+
+/** GBRA-175: one named release (the stable channel's), in the same shape as the latest release. */
+export function fetchReleaseByTag(tag: string): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+  return fetchReleaseJson(`${RELEASES_API_BASE}/tags/${encodeURIComponent(tag)}`);
+}
+
+async function fetchReleaseJson(url: string): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
   try {
-    const res = await fetch(RELEASES_API_URL, {
+    const res = await fetch(url, {
       headers: { 'User-Agent': 'gbrain-self-upgrade' },
       signal: AbortSignal.timeout(5_000),
     });

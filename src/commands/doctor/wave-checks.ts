@@ -190,9 +190,17 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     id: 'foreign_ownership_marker', resolution: 'operator', registration: 'wave',
     hostOnly: 'Ownership markers are private files beside the source checkouts on the brain host.',
     count: d => Number(d.count ?? 0),
-    impact: 'An ownership marker beside a source checkout names another brain or an unknown worktree, so claiming that checkout refuses recovery_required',
-    instruction: 'Confirm with the user that the recorded brain is retired, then remove exactly the marker file doctor names on the brain host and claim again (docs/guides/write-refusals.md#foreign-ownership-marker); never remove a marker of a brain still in use.',
+    impact: 'An ownership marker beside a source checkout names another brain or an unknown worktree, or other users can read it, so claiming or writing that checkout refuses recovery_required',
+    instruction: 'A marker other users can read: run the chmod 600 doctor names on the brain host, never remove it. A marker of another brain: confirm with the user that the recorded brain is retired, then remove exactly the marker file doctor names on the brain host and claim again (docs/guides/write-refusals.md#foreign-ownership-marker); never remove a marker of a brain still in use.',
     run: async engine => (await import('./checks/orphan-bindings.ts')).checkForeignOwnershipMarkers(engine),
+  },
+  {
+    id: 'coordination_lock_location', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Coordination lock reservations are private files beside the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'GBRAIN_COORDINATION_HOME names another directory than a checkout\'s recorded coordination lock, which stays in use',
+    instruction: 'Make the recorded lock directory doctor names survive container recreation and unset GBRAIN_COORDINATION_HOME for that checkout if it was meant to move the lock (docs/architecture/topologies.md#coordination-home-ignored); never edit or delete the reservation.',
+    run: async engine => (await import('./checks/coordination-lock.ts')).checkCoordinationLockLocation(engine),
   },
   {
     id: 'unbound_source', resolution: 'operator', registration: 'wave',
@@ -244,6 +252,21 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/writer-version.ts')).writerVersionCheck(engine),
   },
   {
+    id: 'segmented_storage', resolution: 'operator', registration: 'wave',
+    impact: 'A recent writer older than this release keeps segmented page storage off, so pages over 1 MiB are written inline up to 24 MiB',
+    instruction: 'Run `gbrain upgrade` on each host doctor names (by host UUID), then restart its gbrain processes; the hold clears seven days after that writer\'s last request.',
+    count: d => (Array.isArray(d.blockers) ? d.blockers.length : 0),
+    run: async engine => (await import('./checks/segmented-storage.ts')).segmentedStorageCheck(engine),
+  },
+  {
+    id: 'segmented_tiling', resolution: 'operator', registration: 'doctor.ts',
+    hostOnly: 'It lists page slugs, and the repair it names runs only from the trusted local CLI on the brain host.',
+    impact: 'Some pages stored in segments have segment rows that do not cover their body, so every read of them refuses and sync holds their files',
+    instruction: 'Preview `gbrain repair segmented-tiling --source <id>` (read-only), show the user the listing, and apply it with the printed --expect hash only after they agree; it republishes each page from its file at HEAD and never runs automatically.',
+    count: d => (Array.isArray(d.pages) ? d.pages.length : 0),
+    run: async (engine, scope) => (await import('./checks/segmented-tiling.ts')).segmentedTilingCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'self_capture', resolution: 'operator', registration: 'wave',
     count: d => Number(d.classified ?? 0),
     impact: 'The session corpus still holds files captured from gbrain\'s own model sessions',
@@ -286,11 +309,47 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/google-calendar.ts')).googleCalendarReadableCheck(engine, scope.sourceIds),
   },
   {
+    id: 'google_api_access', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Connector state, the account address and the Google Cloud project live on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'A Google source could not reach a service because its API is disabled for the OAuth project or its scope was not granted, so that service imports nothing',
+    instruction: 'Enable each named API at the console link in the finding (or run `gbrain google connect --reauth <email>` for a missing scope), then confirm with `gbrain google status --json` and run `gbrain sync --source <source>` (docs/guides/google-connect.md#api-access).',
+    run: async (engine, scope) => (await import('./checks/google-api-access.ts')).googleApiAccessCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'atom_provenance_drift', resolution: 'repair', registration: 'doctor.ts',
     hostOnly: 'Retiring stale atoms is a host-side, explicit-only repair.',
     count: d => Number(d.drifted ?? 0),
     impact: 'Some atoms reference a source page that is gone or was edited, and still surface in search with a quote no current page contains',
     run: async engine => (await import('./checks/extraction-sync.ts')).computeAtomProvenanceDriftCheck(engine),
+  },
+  {
+    id: 'atom_retirements_restorable', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring atoms an empty re-extraction retired is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some atoms were retired when a re-extraction returned no atoms, and the purge removes them once their hold ends',
+    run: async (engine, scope) => (await import('./checks/atom-retirements.ts')).atomRetirementsRestorableCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'generation_retirements', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring a derived generation is a host-side, explicit-only repair.',
+    count: d => Number(d.items ?? 0),
+    impact: 'Live generations retired derived items inside the restore window; they stay restorable until the purge hold ends',
+    run: async (engine, scope) => (await import('./checks/generations.ts')).generationRetirementsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'generation_held', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Releasing a held derived generation is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some derived results were held instead of published, so their keys keep the previous generation',
+    run: async (engine, scope) => (await import('./checks/generations.ts')).generationHeldCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'generation_pending', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Pending generation members and orphan candidates are host-side state of managed derived writers.',
+    count: d => Number(d.pending ?? 0) + Number(d.orphans ?? 0),
+    impact: 'Some activated generations still wait on member requests, or pages were written for an activation that never happened',
+    run: async (engine, scope) => (await import('./checks/generations.ts')).generationPendingCheck(engine, scope.sourceIds),
   },
   {
     id: 'extractor_facts_expired', resolution: 'repair', registration: 'wave',
@@ -320,6 +379,26 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
     impact: 'Some active facts were captured from gbrain\'s own model sessions or from pasted text before v0.60.30.0',
     run: async (engine, scope) => (await import('./checks/captured-facts.ts')).capturedFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'agent_session_facts', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Classifying agent-session facts reads the session corpus on the brain host; the repair is explicit-only and needs the user\'s agreement.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some active facts from agent-launched sessions are still attributed to the owner',
+    run: async (engine, scope) => (await import('./checks/agent-session-facts.ts')).agentSessionFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'facts_redaction_marker', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring redacted fact text reads the facts\' source pages and versions on the brain host; the repair is explicit-only.',
+    count: d => Number(d.affected ?? 0),
+    impact: 'Some active facts lost words to the pre-fix prompt sanitizer and hold a [redacted] marker in their stored text',
+    run: async (engine, scope) => (await import('./checks/facts-redaction-marker.ts')).factsRedactionMarkerCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'fact_bulk_dates', resolution: 'repair', registration: 'wave',
+    count: d => Array.isArray(d.days) ? d.days.reduce((sum: number, day: { facts?: number }) => sum + Number(day.facts ?? 0), 0) : 0,
+    impact: 'Some sources hold a large share of facts dated with the day a bulk load ran, which records when they were loaded, not when they happened',
+    run: async (engine, scope) => (await import('./checks/fact-bulk-dates.ts')).factBulkDatesCheck(engine, scope.sourceIds),
   },
   {
     id: 'loop_facts_drift', resolution: 'repair', registration: 'wave',
@@ -359,8 +438,8 @@ export function checkHealthUnknown(check: Check): boolean {
 export interface WaveFinding { spec: WaveCheckSpec; check: Check; state: 'ok' | 'finding' | 'unknown' }
 
 /** Run wave checks; a throwing check becomes an unknown finding instead of aborting the rest. */
-export async function runWaveChecks(engine: BrainEngine, opts: WaveScope & { only?: WaveCheckSpec['registration']; remote?: boolean } = {}): Promise<WaveFinding[]> {
-  const specs = WAVE_CHECKS.filter(spec => (!opts.only || spec.registration === opts.only) && (!opts.remote || !spec.hostOnly));
+export async function runWaveChecks(engine: BrainEngine, opts: WaveScope & { only?: WaveCheckSpec['registration']; ids?: ReadonlySet<string>; remote?: boolean } = {}): Promise<WaveFinding[]> {
+  const specs = WAVE_CHECKS.filter(spec => (!opts.only || spec.registration === opts.only) && (!opts.ids || opts.ids.has(spec.id)) && (!opts.remote || !spec.hostOnly));
   const findings: WaveFinding[] = [];
   for (const spec of specs) {
     let check: Check;
@@ -395,9 +474,10 @@ export const REMOTE_HOST_ACTION = 'host operator action required: on the brain h
  */
 export async function remoteWaveHandoff(engine: BrainEngine, sourceIds?: string[]): Promise<Check[]> {
   const findings = await runWaveChecks(engine, { sourceIds, remote: true });
-  return findings.map(({ spec, state }) => {
+  return findings.map(({ spec, check, state }) => {
     const host_action = { check_id: spec.id, state: state === 'finding' ? 'action_required' : state, preview_command: 'gbrain doctor --remediation-plan' };
-    if (state === 'ok') return { name: spec.id, status: 'ok' as const, message: 'No host action needed.', details: { host_action } };
+    if (state === 'ok') return { name: spec.id, status: 'ok' as const, message: 'No host action needed.', details: { host_action },
+      ...(check.severity ? { severity: check.severity } : {}), ...(check.readiness_state ? { readiness_state: check.readiness_state } : {}) };
     if (state === 'unknown') return { name: spec.id, status: 'warn' as const, details: { host_action },
       message: `Unknown: this check could not run for the remote caller; ${REMOTE_HOST_ACTION}.` };
     return { name: spec.id, status: 'warn' as const, details: { host_action }, message: `${spec.impact}; ${REMOTE_HOST_ACTION}.` };

@@ -115,6 +115,21 @@ in addition to the fork's `plugin.json`, `.github/plugin/marketplace.json` and
 hand-merging conflict hunks. Fork URL repoints must import from
 `src/core/repo-coordinates.ts`.
 
+**New upstream URL call sites** — upstream keeps adding code that hardcodes
+`garrytan/gbrain` (e.g. the stable channel in `src/core/stable-channel.ts`, the
+agent-install and upgrade-restart paths). After the merge, grep the incoming diff
+for `garrytan/gbrain` and route every functional URL through
+`src/core/repo-coordinates.ts`; `check-fork-hygiene.sh` only catches raw URLs in
+docs/scripts, not GitHub API or clone URLs in `src/`.
+
+**New upstream workflows** arrive with Ubicloud runners and schedules; apply the
+same CI deltas as above (runners, `main`, schedules removed) to each new file.
+
+**Distribution tags** — the fork publishes no `stable` / `latest-stable` tags, so
+the stable-channel update check stays quiet and `#latest-stable` install pins in
+fork docs resolve only once a tag exists. Keep the fork's install pins rather than
+adopting upstream's `garrytan/gbrain#stable` lines.
+
 **Everything else** — merge on the merits. Upstream's `src/` fixes and new tests
 are the whole point of tracking upstream.
 
@@ -126,6 +141,7 @@ bun install                                    # refresh bun.lock against merged
 bun run build:llms
 bash scripts/build-copilot-plugin.sh
 bun run scripts/generate-plugin-tree.ts --out plugin --variants-out plugin-variants
+bun run regen:all                              # every other generated artifact (schema, manifests, lockfiles)
 # Prove it's green + no upstream leakage:
 bun run typecheck   > out-tc.txt  2>&1; echo "EXIT=$?"
 bun run verify      > out-ver.txt 2>&1; echo "EXIT=$?"
@@ -136,6 +152,14 @@ bash scripts/check-fork-hygiene.sh             # catches leaked garrytan/gbrain 
 > **Never pipe test output through `tail`/`head`** — the exit code becomes
 > `tail`'s (always 0) and failure detail is truncated. Redirect to a file first,
 > then inspect it. (This is a `CLAUDE.md` iron rule.)
+
+> **Windows:** the generators expect LF files; with Git's default
+> `core.autocrlf=true` they fail (e.g. `build-schema.ts` reports "no generated
+> region"). Set `git config core.autocrlf false` in the fork checkout and
+> re-checkout, and run the `bash` scripts with Git Bash, not WSL's `bash.exe`.
+
+> **CI on the PR:** `test.yml` runs only a cheap tier on pull requests. Add the
+> `full-ci` label or `gh workflow run test.yml --ref <branch>` for the full suite.
 
 Then run the 3-line version-consistency audit from `CLAUDE.md` and ship via
 `/ship`.

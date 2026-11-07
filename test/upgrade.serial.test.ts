@@ -8,6 +8,7 @@ import { formatMarker } from '../src/core/self-upgrade.ts';
 import type { BinarySelfUpdateResult } from '../src/core/binary-self-update.ts';
 import { VERSION } from '../src/version.ts';
 import { GITHUB_REPO, GITHUB_URL, RELEASES_URL } from '../src/core/repo-coordinates.ts';
+import { fileURLToPath } from 'node:url';
 
 // Install-method detection runs in-process where it spawns nothing (argv[1] /
 // execPath patched); PATH-shimmed paths (clawhub, bun-link, bun update) run
@@ -16,7 +17,7 @@ import { GITHUB_REPO, GITHUB_URL, RELEASES_URL } from '../src/core/repo-coordina
 describe('upgrade command', () => {
   test('--help prints usage and exits 0', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'upgrade', '--help'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -29,7 +30,7 @@ describe('upgrade command', () => {
 
   test('-h also prints usage', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'upgrade', '-h'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -170,7 +171,7 @@ describe('post-upgrade behavior (post v0.12.0 merge)', () => {
 
   test('--help prints usage', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'post-upgrade', '--help'], {
-      cwd: new URL('..', import.meta.url).pathname,
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -208,7 +209,7 @@ describe('assessUpgradeOutcome (#4366)', () => {
 describe('runUpgrade target verification (#4366)', () => {
   const TARGET = '99.99.99.0';
   const OLD = '0.40.0.0';
-  const repoRoot = new URL('..', import.meta.url).pathname;
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 
   /**
    * Build a hermetic fake install under a temp HOME and run runUpgrade in a
