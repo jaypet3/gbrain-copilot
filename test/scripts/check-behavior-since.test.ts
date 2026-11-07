@@ -8,9 +8,10 @@
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { load as loadYaml } from 'js-yaml';
 import { main, NOTICE_FILE, tbdLines } from '../../scripts/check-behavior-since.ts';
 import { DEFAULT_CHECKS } from '../../scripts/release-restamp.ts';
 import { BEHAVIOR_NOTICE_FILE, restampSinceLines, stampTbdSince } from '../../scripts/lib/restamp.ts';
@@ -133,6 +134,29 @@ describe('check:behavior-since', () => {
     const local = run(root);
     expect(local.code).toBe(0);
     expect(local.out).toContain('GBRAIN_CHECK_SKIPPED');
+  });
+
+  test('the verify workflow uses the fork base for unstamped and stamped branches', () => {
+    const root = repo();
+    git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    git(root, 'update-ref', '-d', 'refs/remotes/origin/master');
+    const workflow = loadYaml(readFileSync(join(import.meta.dir, '../../.github/workflows/test.yml'), 'utf8')) as {
+      env: Record<string, string>;
+      jobs: { verify: { env?: Record<string, string>; steps: Array<{ run?: string; env?: Record<string, string> }> } };
+    };
+    const step = workflow.jobs.verify.steps.find((entry) => entry.run === 'bun run verify');
+    expect(step).toBeDefined();
+    const env = { ...workflow.env, ...workflow.jobs.verify.env, ...step?.env, CI: 'true' };
+    put(root, { [NOTICE_FILE]: notice('0.60.322.0', 'TBD') });
+    commit(root, 'unstamped');
+    const unstamped = run(root, [], env);
+    expect(unstamped.code).toBe(0);
+    expect(unstamped.out).toContain("origin/main's");
+    put(root, { VERSION: '0.60.323.0\n', 'CHANGELOG.md': changelog('0.60.323.0', '0.60.322.0') });
+    commit(root, 'stamped');
+    const stamped = run(root, [], env);
+    expect(stamped.code).toBe(1);
+    expect(stamped.out).toContain('a stamped tree');
   });
 
   test('unknown arguments are a usage error', () => {

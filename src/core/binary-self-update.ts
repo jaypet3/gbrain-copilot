@@ -47,6 +47,7 @@ import { dirname, join } from 'node:path';
 import { execFileSync } from './spawn.ts';
 import { createHash } from 'node:crypto';
 import { DEFAULT_BRANCH, GITHUB_REPO, GITHUB_URL, RELEASES_API_BASE, RELEASES_API_URL } from './repo-coordinates.ts';
+import { parseSemver, semverGt } from './semver.ts';
 
 /**
  * The attestation's builder id must be EXACTLY one of these — it binds the
@@ -75,6 +76,8 @@ export interface ReleaseAsset {
 export type BinarySelfUpdateReason =
   | 'unsupported_platform'
   | 'fetch_failed'
+  | 'older_release'
+  | 'invalid_version'
   | 'no_asset'
   | 'download_failed'
   | 'integrity_unavailable'
@@ -128,6 +131,8 @@ export function resolvePlatformAsset(
 export interface BinarySelfUpdateDeps {
   /** Fetch the latest release's tag + asset list. Default hits the GitHub API. */
   fetchRelease?: () => Promise<{ tag: string; assets: ReleaseAsset[] } | null>;
+  /** Refuse a release below this version; omit for an explicitly authorized rollback. */
+  minimumVersion?: string;
   /** Download `url` to `destPath`. Default streams the HTTP body to disk. */
   download?: (url: string, destPath: string) => Promise<void>;
   /** Smoke-test the staged binary; returns true if `<path> --version` looks like gbrain. */
@@ -356,6 +361,17 @@ export async function runBinarySelfUpdate(
     return { ok: false, reason: 'fetch_failed', asset: assetName };
   }
   const targetVersion = release.tag.replace(/^v/, '').trim();
+
+  if (deps.minimumVersion !== undefined) {
+    const minimum = parseSemver(deps.minimumVersion);
+    const target = parseSemver(targetVersion);
+    if (!minimum || !target) {
+      return { ok: false, reason: 'invalid_version', asset: assetName, targetVersion };
+    }
+    if (semverGt(minimum, target)) {
+      return { ok: false, reason: 'older_release', asset: assetName, targetVersion };
+    }
+  }
 
   const url = resolvePlatformAsset(release.assets, platform, arch);
   if (!url) {

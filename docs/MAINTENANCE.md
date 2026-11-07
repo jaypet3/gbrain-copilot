@@ -88,8 +88,10 @@ Copilot packaging, so its version of these files is always wrong for the fork:
   - **Runners:** upstream uses Ubicloud labels (`ubicloud-standard-N-ubuntu-2404`);
     the fork has none, so rewrite them to `ubuntu-latest` (jobs would queue forever).
   - **Branch:** `main`, not `master` (triggers, `origin/master` baseline fetches,
-    `blob/master` links). Leave `fix-wave-*.yml` and `nightly-watch.yml` on
-    `master` — they are upstream-maintainer governance and stay inert here.
+    `blob/master` links). New verify guards may default to `origin/master`;
+    set their base-ref environment overrides to the fetched `origin/main`.
+    Leave `fix-wave-*.yml` and `nightly-watch.yml` on `master` — they are
+    upstream-maintainer governance and stay inert here.
   - **No schedules:** every `schedule:`/cron is disabled (Actions budget); `e2e.yml`
     is **dispatch-only** (needs API-key secrets); heavy-tests runs via label/dispatch.
   - **Release gate:** `scripts/release-gate.ts` gates only on the `Test` workflow

@@ -70,6 +70,8 @@ env:
   BRAINBENCH_MAIN_REF: origin/main
   GBRAIN_MIGRATION_BASE_REF: origin/main
   GBRAIN_FUNCTION_SIZE_BASE_REF: origin/main
+  GBRAIN_CHANGELOG_BASE_REF: origin/main
+  GBRAIN_RELEASE_BASE_REF: origin/main
 
 jobs:
   # Trunk Dynamic CI filter (docs/ci-event-parity.md#trunk-dynamic-ci). It asks Trunk

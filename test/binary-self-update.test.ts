@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   defaultFetchAttestation,
   expectedAssetName,
@@ -13,6 +14,7 @@ import {
   type ReleaseAsset,
 } from '../src/core/binary-self-update.ts';
 import { DEFAULT_BRANCH, GITHUB_REPO, GITHUB_URL, UPSTREAM_REPO } from '../src/core/repo-coordinates.ts';
+import { VERSION } from '../src/version.ts';
 
 const ASSETS: ReleaseAsset[] = [
   { name: 'gbrain-darwin-arm64', url: 'https://example.com/darwin-arm64' },
@@ -65,7 +67,220 @@ async function withTmp<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
+function exerciseUpgradeCommand(dir: string, mode: 'alpha' | 'stable' | 'invalid') {
+  const moduleUrl = (file: string) => pathToFileURL(join(import.meta.dir, '..', ...file.split('/'))).href;
+  const driver = join(dir, 'upgrade-driver.ts');
+  writeFileSync(driver, `
+import { mock } from 'bun:test';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const dir = process.argv[2];
+const mode = process.argv[3];
+const { VERSION } = await import(${JSON.stringify(moduleUrl('src/version.ts'))});
+const coordinates = await import(${JSON.stringify(moduleUrl('src/core/repo-coordinates.ts'))});
+const target = join(dir, process.platform === 'win32' ? 'gbrain.exe' : 'gbrain');
+const receiptPath = join(dir, 'swap-receipt.json');
+const summaryPath = join(dir, 'upgrade-summary.json');
+const tag = mode === 'invalid' ? 'release-candidate' : 'v0.0.0.1';
+const release = { tag, assets: [{ name: 'gbrain-linux-x64', url: 'https://example.com/asset' }] };
+let downloads = 0;
+let minimumVersion = null;
+let requestedTag = null;
+writeFileSync(target, 'gbrain ' + VERSION);
+process.execPath = target;
+process.argv[1] = join(dir, 'not-a-repository');
+
+const stable = await import(${JSON.stringify(moduleUrl('src/core/stable-channel.ts'))});
+mock.module(${JSON.stringify(moduleUrl('src/core/stable-channel.ts'))}, () => ({
+  ...stable,
+  resolveStableRelease: async () => ({ ok: true, version: '0.0.0.1', commit: 'a'.repeat(40), record: { known_bad: [VERSION] } }),
+}));
+
+const spawn = await import(${JSON.stringify(moduleUrl('src/core/spawn.ts'))});
+mock.module(${JSON.stringify(moduleUrl('src/core/spawn.ts'))}, () => ({
+  ...spawn,
+  execSync: (command, ...args) => command === 'gbrain --version' ? readFileSync(target, 'utf8') : spawn.execSync(command, ...args),
+  spawnSync: (command, args, options) => command === 'gbrain' && args[0] === '--help'
+    ? { status: 0, stderr: '' } : spawn.spawnSync(command, args, options),
+}));
+
+const binary = await import(${JSON.stringify(moduleUrl('src/core/binary-self-update.ts'))});
+const realUpdate = binary.runBinarySelfUpdate;
+mock.module(${JSON.stringify(moduleUrl('src/core/binary-self-update.ts'))}, () => ({
+  ...binary,
+  fetchReleaseByTag: async (requested) => { requestedTag = requested; return release; },
+  runBinarySelfUpdate: (path, deps = {}) => {
+    minimumVersion = deps.minimumVersion ?? null;
+    return realUpdate(path, {
+      ...deps,
+      platform: 'linux',
+      arch: 'x64',
+      fetchRelease: deps.fetchRelease ?? (async () => release),
+      download: async (_url, dest) => { downloads++; writeFileSync(dest, 'gbrain ' + tag.replace(/^v/, '')); },
+      smoke: () => true,
+      checkVersion: () => true,
+      computeDigest: () => 'a'.repeat(64),
+      fetchAttestation: async () => [{
+        subjects: [{ name: 'gbrain-linux-x64', sha256: 'a'.repeat(64) }],
+        builderId: coordinates.GITHUB_URL + '/.github/workflows/release.yml@refs/heads/' + coordinates.DEFAULT_BRANCH,
+      }],
+    });
+  },
+}));
+
+const { runUpgrade } = await import(${JSON.stringify(moduleUrl('src/commands/upgrade.ts'))});
+await runUpgrade(['--channel', mode === 'stable' ? 'stable' : 'alpha', '--swap-only']);
+writeFileSync(summaryPath, JSON.stringify({
+  downloads, minimumVersion, requestedTag, contents: readFileSync(target, 'utf8'),
+  receipt: existsSync(receiptPath) ? JSON.parse(readFileSync(receiptPath, 'utf8')) : null,
+}));
+`);
+  const proc = Bun.spawnSync([process.execPath, driver, dir, mode], {
+    cwd: dir,
+    env: {
+      ...process.env,
+      HOME: dir,
+      USERPROFILE: dir,
+      GBRAIN_HOME: join(dir, 'brain'),
+      GBRAIN_SWAP_RECEIPT: join(dir, 'swap-receipt.json'),
+      GBRAIN_SKIP_STARTUP_HOOKS: '1',
+      DATABASE_URL: '',
+      GBRAIN_DATABASE_URL: '',
+    },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const stdout = Buffer.from(proc.stdout).toString();
+  const stderr = Buffer.from(proc.stderr).toString();
+  const summaryPath = join(dir, 'upgrade-summary.json');
+  let summary: {
+    downloads: number;
+    minimumVersion: string | null;
+    requestedTag: string | null;
+    contents: string;
+    receipt: { outcome: string; from: string; installed: string | null } | null;
+  };
+  try {
+    summary = JSON.parse(readFileSync(summaryPath, 'utf8'));
+  } catch {
+    throw new Error(`Upgrade fixture failed (exit ${proc.exitCode}):\n${stdout}\n${stderr}`);
+  }
+  return { ...summary, exitCode: proc.exitCode, stdout, stderr };
+}
+
 describe('runBinarySelfUpdate', () => {
+  test('alpha upgrade holds an older release without reporting a swap', async () => {
+    await withTmp(async (dir) => {
+      const result = exerciseUpgradeCommand(dir, 'alpha');
+      expect(result.exitCode).toBe(0);
+      expect(result.minimumVersion).toBe(VERSION);
+      expect(result.downloads).toBe(0);
+      expect(result.contents).toBe(`gbrain ${VERSION}`);
+      expect(result.receipt).toMatchObject({ outcome: 'not_installed', from: VERSION });
+      expect(result.stdout).toContain('older than');
+    });
+  }, 20_000);
+
+  test('an unparseable published alpha version fails without changing the binary', async () => {
+    await withTmp(async (dir) => {
+      const result = exerciseUpgradeCommand(dir, 'invalid');
+      expect(result.exitCode).toBe(1);
+      expect(result.downloads).toBe(0);
+      expect(result.contents).toBe(`gbrain ${VERSION}`);
+      expect(result.receipt).toMatchObject({ outcome: 'not_installed', from: VERSION });
+      expect(result.stderr).toContain('cannot compare');
+    });
+  }, 20_000);
+
+  test('stable can replace a withdrawn build with the earlier promoted release', async () => {
+    await withTmp(async (dir) => {
+      const result = exerciseUpgradeCommand(dir, 'stable');
+      expect(result.exitCode).toBe(0);
+      expect(result.minimumVersion).toBeNull();
+      expect(result.requestedTag).toBe('v0.0.0.1');
+      expect(result.downloads).toBe(1);
+      expect(result.contents).toBe('gbrain 0.0.0.1');
+      expect(result.receipt).toMatchObject({ outcome: 'installed', from: VERSION, installed: '0.0.0.1' });
+      expect(result.stdout).toContain('withdrawn');
+    });
+  }, 20_000);
+
+  test('an older published release cannot replace a newer installed binary', async () => {
+    await withTmp(async (dir) => {
+      const target = join(dir, 'gbrain');
+      writeFileSync(target, 'INSTALLED');
+      let downloaded = false;
+      const res = await runBinarySelfUpdate(target, {
+        platform: 'linux',
+        arch: 'x64',
+        minimumVersion: '0.60.607.1',
+        fetchRelease: async () => ({ tag: 'v0.42.57.1', assets: ASSETS }),
+        download: async (_url, dest) => {
+          downloaded = true;
+          writeFileSync(dest, 'OLDER');
+        },
+        smoke: () => true,
+        checkVersion: () => true,
+        ...passingIntegrity('gbrain-linux-x64'),
+      });
+      expect(res.reason).toBe('older_release');
+      expect(res.targetVersion).toBe('0.42.57.1');
+      expect(downloaded).toBe(false);
+      expect(readFileSync(target, 'utf8')).toBe('INSTALLED');
+      expect(readdirSync(dir)).toEqual(['gbrain']);
+    });
+  });
+
+  test.each([
+    ['unparseable installed version', 'development', 'v1.2.3.4'],
+    ['unparseable release version', '1.2.3.4', 'release-candidate'],
+  ])('%s refuses the binary swap', async (_label, minimumVersion, tag) => {
+    await withTmp(async (dir) => {
+      const target = join(dir, 'gbrain');
+      writeFileSync(target, 'INSTALLED');
+      let downloaded = false;
+      const res = await runBinarySelfUpdate(target, {
+        platform: 'linux',
+        arch: 'x64',
+        minimumVersion,
+        fetchRelease: async () => ({ tag, assets: ASSETS }),
+        download: async (_url, dest) => {
+          downloaded = true;
+          writeFileSync(dest, 'REPLACEMENT');
+        },
+        smoke: () => true,
+        checkVersion: () => true,
+        ...passingIntegrity('gbrain-linux-x64'),
+      });
+      expect(res.reason).toBe('invalid_version');
+      expect(downloaded).toBe(false);
+      expect(readFileSync(target, 'utf8')).toBe('INSTALLED');
+    });
+  });
+
+  test.each([
+    ['equal normalized versions', 'v1.2.3'],
+    ['a newer micro version', 'v1.2.3.1'],
+  ])('%s remain installable', async (_label, tag) => {
+    await withTmp(async (dir) => {
+      const target = join(dir, 'gbrain');
+      writeFileSync(target, 'INSTALLED');
+      const res = await runBinarySelfUpdate(target, {
+        platform: 'linux',
+        arch: 'x64',
+        minimumVersion: '1.2.3.0',
+        fetchRelease: async () => ({ tag, assets: ASSETS }),
+        download: async (_url, dest) => writeFileSync(dest, 'REPLACEMENT'),
+        smoke: () => true,
+        checkVersion: () => true,
+        ...passingIntegrity('gbrain-linux-x64'),
+      });
+      expect(res.ok).toBe(true);
+      expect(readFileSync(target, 'utf8')).toBe('REPLACEMENT');
+    });
+  });
+
   test('happy path: stages, verifies integrity, smokes, atomically replaces the target', async () => {
     await withTmp(async (dir) => {
       const target = join(dir, 'gbrain');

@@ -15,6 +15,7 @@ import { loadCompletedMigrations } from '../core/preferences.ts';
 import { MIGRATIONS_RUNNING_EXIT_CODE, readMigrationLockHolder } from '../core/migration-orchestration-lock.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { clearSnooze, clearUpdateCache, currentReleaseChannel, writeJustUpgraded, writeSwapReceipt, type ReleaseChannel } from '../core/self-upgrade.ts';
+import type { BinarySelfUpdateResult } from '../core/binary-self-update.ts';
 import { handleRestartOnly, preflightHostRestart } from './upgrade-restart.ts';
 import { resolveStableRelease } from '../core/stable-channel.ts';
 import { channelTarget, runUpgradeDryRun } from './upgrade-channel.ts';
@@ -140,7 +141,8 @@ export async function runUpgrade(args: string[], opts: { targetVersion?: string 
       // (darwin-arm64, linux-x64). Other platforms have no asset → notify.
       const { runBinarySelfUpdate } = await import('../core/binary-self-update.ts');
       console.log('Updating gbrain binary (atomic download + replace)...');
-      const result = await runBinarySelfUpdate();
+      const result = await runBinarySelfUpdate(undefined, { minimumVersion: oldVersion });
+      if (handleBinaryVersionRefusal(result, oldVersion)) return;
       if (result.ok) {
         upgraded = true;
       } else if (result.reason === 'unsupported_platform' || result.reason === 'no_asset') {
@@ -348,6 +350,27 @@ export async function runUpgrade(args: string[], opts: { targetVersion?: string 
   console.log(restartLine);
   // #6317 (I2): the supervisor proves data movement once serve and the workers run the new build.
   console.log(`Next: ${MOVEMENT_SUPERVISOR_STEP}`);
+}
+
+function handleBinaryVersionRefusal(result: BinarySelfUpdateResult, oldVersion: string): boolean {
+  if (result.reason === 'older_release') {
+    console.log(`The latest published release (${result.targetVersion}) is older than installed gbrain ${oldVersion}. Nothing was changed.`);
+    console.log(`Binary: no newer version installed (still ${oldVersion}).`);
+    writeSwapReceipt({ outcome: 'not_installed', from: oldVersion, installed: null });
+    return true;
+  }
+  if (result.reason !== 'invalid_version') return false;
+  console.error(`Binary self-update rejected: cannot compare installed version ${oldVersion} with published version ${result.targetVersion}. Your existing binary is unchanged.`);
+  recordUpgradeError({
+    phase: 'binary-self-update',
+    fromVersion: oldVersion,
+    toVersion: result.targetVersion ?? 'unknown',
+    error: result.reason,
+    recover: `Check the published release version at ${RELEASES_URL}.`,
+  });
+  writeSwapReceipt({ outcome: 'not_installed', from: oldVersion, installed: null });
+  setCliExitVerdict(1);
+  return true;
 }
 
 /** GBRA-175: the new build restarts every process onto itself and verifies one build runs; returns the summary line. */

@@ -5,9 +5,10 @@
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { load as loadYaml } from 'js-yaml';
 import { main } from '../../scripts/check-changelog-headings.ts';
 import { DEFAULT_CHECKS } from '../../scripts/release-restamp.ts';
 
@@ -57,6 +58,26 @@ describe('check:changelog-headings', () => {
     git(root, 'update-ref', '-d', 'refs/remotes/origin/master');
     expect(run(root, { CI: 'true' }).code).toBe(1);
     expect(run(root).out).toContain('GBRAIN_CHECK_SKIPPED');
+  });
+
+  test('the verify workflow checks the fork base and still refuses a truncated changelog', () => {
+    const root = repo();
+    git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    git(root, 'update-ref', '-d', 'refs/remotes/origin/master');
+    const workflow = loadYaml(readFileSync(join(import.meta.dir, '../../.github/workflows/test.yml'), 'utf8')) as {
+      env: Record<string, string>;
+      jobs: { verify: { env?: Record<string, string>; steps: Array<{ run?: string; env?: Record<string, string> }> } };
+    };
+    const step = workflow.jobs.verify.steps.find((entry) => entry.run === 'bun run verify');
+    expect(step).toBeDefined();
+    const env = { ...workflow.env, ...workflow.jobs.verify.env, ...step?.env, CI: 'true' };
+    const complete = run(root, env);
+    expect(complete.code).toBe(0);
+    expect(complete.out).toContain('every release heading on origin/main is present');
+    writeFileSync(join(root, 'CHANGELOG.md'), changelog('0.60.322.0'));
+    const truncated = run(root, env);
+    expect(truncated.code).toBe(1);
+    expect(truncated.out).toContain('missing 2 release heading(s)');
   });
 
   test("release:restamp's drift checks run it", () => {
