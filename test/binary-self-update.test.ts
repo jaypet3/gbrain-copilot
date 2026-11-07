@@ -92,13 +92,13 @@ process.execPath = target;
 process.argv[1] = join(dir, 'not-a-repository');
 
 const stable = await import(${JSON.stringify(moduleUrl('src/core/stable-channel.ts'))});
-mock.module(${JSON.stringify(moduleUrl('src/core/stable-channel.ts'))}, () => ({
+mock['module'](${JSON.stringify(moduleUrl('src/core/stable-channel.ts'))}, () => ({
   ...stable,
   resolveStableRelease: async () => ({ ok: true, version: '0.0.0.1', commit: 'a'.repeat(40), record: { known_bad: [VERSION] } }),
 }));
 
 const spawn = await import(${JSON.stringify(moduleUrl('src/core/spawn.ts'))});
-mock.module(${JSON.stringify(moduleUrl('src/core/spawn.ts'))}, () => ({
+mock['module'](${JSON.stringify(moduleUrl('src/core/spawn.ts'))}, () => ({
   ...spawn,
   execSync: (command, ...args) => command === 'gbrain --version' ? readFileSync(target, 'utf8') : spawn.execSync(command, ...args),
   spawnSync: (command, args, options) => command === 'gbrain' && args[0] === '--help'
@@ -107,7 +107,7 @@ mock.module(${JSON.stringify(moduleUrl('src/core/spawn.ts'))}, () => ({
 
 const binary = await import(${JSON.stringify(moduleUrl('src/core/binary-self-update.ts'))});
 const realUpdate = binary.runBinarySelfUpdate;
-mock.module(${JSON.stringify(moduleUrl('src/core/binary-self-update.ts'))}, () => ({
+mock['module'](${JSON.stringify(moduleUrl('src/core/binary-self-update.ts'))}, () => ({
   ...binary,
   fetchReleaseByTag: async (requested) => { requestedTag = requested; return release; },
   runBinarySelfUpdate: (path, deps = {}) => {
