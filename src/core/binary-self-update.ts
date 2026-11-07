@@ -46,7 +46,7 @@ import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, un
 import { dirname, join } from 'node:path';
 import { execFileSync } from './spawn.ts';
 import { createHash } from 'node:crypto';
-import { RELEASES_API_BASE, RELEASES_API_URL } from './repo-coordinates.ts';
+import { DEFAULT_BRANCH, GITHUB_REPO, GITHUB_URL, RELEASES_API_BASE, RELEASES_API_URL } from './repo-coordinates.ts';
 
 /**
  * The attestation's builder id must be EXACTLY one of these — it binds the
@@ -58,14 +58,14 @@ import { RELEASES_API_BASE, RELEASES_API_URL } from './repo-coordinates.ts';
  * test/release-workflow.test.ts.
  */
 export const EXPECTED_BUILDER_ID_PREFIX =
-  'https://github.com/garrytan/gbrain/.github/workflows/release.yml@';
+  `${GITHUB_URL}/.github/workflows/release.yml@`;
 export const EXPECTED_BUILDER_IDS: readonly string[] = [
-  `${EXPECTED_BUILDER_ID_PREFIX}refs/heads/master`,
+  `${EXPECTED_BUILDER_ID_PREFIX}refs/heads/${DEFAULT_BRANCH}`,
 ];
 
 /** Base for the GitHub attestation REST endpoint (per-subject-digest lookup). */
 const ATTESTATION_API_BASE =
-  'https://api.github.com/repos/garrytan/gbrain/attestations/sha256:';
+  `https://api.github.com/repos/${GITHUB_REPO}/attestations/sha256:`;
 
 export interface ReleaseAsset {
   name: string;

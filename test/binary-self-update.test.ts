@@ -12,14 +12,14 @@ import {
   type ParsedAttestation,
   type ReleaseAsset,
 } from '../src/core/binary-self-update.ts';
+import { DEFAULT_BRANCH, GITHUB_REPO, GITHUB_URL, UPSTREAM_REPO } from '../src/core/repo-coordinates.ts';
 
 const ASSETS: ReleaseAsset[] = [
   { name: 'gbrain-darwin-arm64', url: 'https://example.com/darwin-arm64' },
   { name: 'gbrain-linux-x64', url: 'https://example.com/linux-x64' },
 ];
 
-// A builder id that matches EXPECTED_BUILDER_ID_PREFIX (this repo's release workflow).
-const VALID_BUILDER = 'https://github.com/garrytan/gbrain/.github/workflows/release.yml@refs/heads/master';
+const VALID_BUILDER = `${GITHUB_URL}/.github/workflows/release.yml@refs/heads/${DEFAULT_BRANCH}`;
 const FAKE_DIGEST = 'a'.repeat(64);
 const OTHER_DIGEST = 'b'.repeat(64);
 
@@ -239,6 +239,35 @@ describe('runBinarySelfUpdate', () => {
     });
   });
 
+  test('upstream builder → integrity_failed without executing the downloaded binary', async () => {
+    await withTmp(async (dir) => {
+      const target = join(dir, 'gbrain');
+      writeFileSync(target, 'OLD');
+      let smokeCalled = false;
+      const res = await runBinarySelfUpdate(target, {
+        platform: 'darwin',
+        arch: 'arm64',
+        fetchRelease: async () => ({ tag: 'v9.9.9', assets: ASSETS }),
+        download: async (_url, dest) => writeFileSync(dest, 'NEW'),
+        computeDigest: () => FAKE_DIGEST,
+        fetchAttestation: async () => [
+          {
+            subjects: [{ name: 'gbrain-darwin-arm64', sha256: FAKE_DIGEST }],
+            builderId: `https://github.com/${UPSTREAM_REPO}/.github/workflows/release.yml@refs/heads/master`,
+          },
+        ],
+        smoke: () => {
+          smokeCalled = true;
+          return true;
+        },
+      });
+      expect(res.reason).toBe('integrity_failed');
+      expect(readFileSync(target, 'utf8')).toBe('OLD');
+      expect(smokeCalled).toBe(false);
+      expect(readdirSync(dir).filter((f) => f.includes('.tmp.'))).toEqual([]);
+    });
+  });
+
   test('no attestation available (404/offline/rate-limited) → integrity_unavailable, fail-closed', async () => {
     await withTmp(async (dir) => {
       const target = join(dir, 'gbrain');
@@ -263,7 +292,7 @@ describe('runBinarySelfUpdate', () => {
     });
   });
 
-  test('right workflow, wrong ref (dispatch from a non-master branch) → integrity_failed', async () => {
+  test('right workflow, wrong ref (dispatch from another branch) → integrity_failed', async () => {
     await withTmp(async (dir) => {
       const target = join(dir, 'gbrain');
       writeFileSync(target, 'OLD');
@@ -277,8 +306,7 @@ describe('runBinarySelfUpdate', () => {
           {
             subjects: [{ name: 'gbrain-darwin-arm64', sha256: FAKE_DIGEST }],
             // Same repo + workflow, but minted from an arbitrary branch dispatch.
-            builderId:
-              'https://github.com/garrytan/gbrain/.github/workflows/release.yml@refs/heads/attacker-branch',
+            builderId: `${GITHUB_URL}/.github/workflows/release.yml@refs/heads/attacker-branch`,
           },
         ],
         smoke: () => true,
@@ -356,9 +384,14 @@ describe('defaultFetchAttestation (global fetch stubbed)', () => {
   };
 
   test('200 with valid bundles → parsed attestations', async () => {
-    stubFetch(() => apiResponse([bundleFor(VALID_STMT)]));
+    let requestedUrl = '';
+    stubFetch((url) => {
+      requestedUrl = url;
+      return apiResponse([bundleFor(VALID_STMT)]);
+    });
     try {
       const parsed = await defaultFetchAttestation(FAKE_DIGEST);
+      expect(requestedUrl).toBe(`https://api.github.com/repos/${GITHUB_REPO}/attestations/sha256:${FAKE_DIGEST}`);
       expect(parsed).not.toBeNull();
       expect(parsed![0]!.builderId).toBe(VALID_BUILDER);
       expect(parsed![0]!.subjects).toEqual([{ name: 'gbrain-linux-x64', sha256: FAKE_DIGEST }]);

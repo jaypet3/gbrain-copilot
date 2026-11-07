@@ -13,6 +13,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EXPECTED_BUILDER_IDS, expectedAssetName } from '../src/core/binary-self-update.ts';
+import { DEFAULT_BRANCH, GITHUB_URL } from '../src/core/repo-coordinates.ts';
 
 const ROOT = join(import.meta.dir, '..');
 const WORKFLOW = readFileSync(join(ROOT, '.github/workflows/release.yml'), 'utf8');
@@ -90,13 +91,11 @@ describe('release.yml ↔ binary-self-update asset contract', () => {
     // verifyIntegrity accepts only attestations whose builder id is exactly
     // release.yml@<trusted ref>. If the workflow file is renamed or the ref
     // scheme changes, this test forces the constant to move in lockstep.
-    for (const id of EXPECTED_BUILDER_IDS) {
-      expect(id).toContain('/.github/workflows/release.yml@');
-      const ref = id.split('@')[1]!;
-      expect(ref.startsWith('refs/')).toBe(true);
-    }
-    // The workflow this repo actually ships from is the one the ids name.
-    expect(EXPECTED_BUILDER_IDS.some((id) => id.endsWith('@refs/heads/master'))).toBe(true);
+    const pushedBranch = WORKFLOW.match(/push:\s*\n\s*branches:\s*\[([^\]]+)\]/)?.[1]?.trim();
+    expect(pushedBranch).toBe(DEFAULT_BRANCH);
+    expect(EXPECTED_BUILDER_IDS).toEqual([
+      `${GITHUB_URL}/.github/workflows/release.yml@refs/heads/${DEFAULT_BRANCH}`,
+    ]);
   });
 
   test('release builds the admin UI fresh from source before compiling', () => {
