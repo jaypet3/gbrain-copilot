@@ -12,7 +12,7 @@
  */
 import { expect, test } from 'bun:test';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 
 const OPEN_WITHOUT_DEFERRED = /'queued', ?'running', ?'recovering'/g;
 
@@ -27,7 +27,7 @@ const DECIDED: Record<string, { count: number; why: string }> = {
   'src/core/persistence/atom-maintenance.ts': { count: 3, why: 'maintenance producer, never deferred' },
   'src/core/persistence/atom-retry.ts': { count: 2, why: 'receipt state' },
   'src/core/persistence/checkpoint-validation.ts': { count: 2, why: 'managed sync' },
-  'src/core/persistence/journal.ts': { count: 8, why: 'claim and head selectors pair the list with RELEASED_DEFERRED (EARLIER_HEAD with its own EARLIER_DEFERRED probe); the two named-sync lists match sync rows, never deferred; the rest are recovery rules' },
+  'src/core/persistence/journal.ts': { count: 7, why: 'claim and head selectors pair the list with RELEASED_DEFERRED (EARLIER_HEAD with its own EARLIER_DEFERRED probe); the two named-sync lists match sync rows, never deferred; the rest are recovery rules' },
   'src/core/persistence/managed-sync-orphans.ts': { count: 4, why: 'managed sync' },
   'src/core/persistence/refresh-barrier.ts': { count: 1, why: 'the downgrade backlog names deferred ahead of the open states: a released deferred row that is still queued or running has not published' },
   'src/core/persistence/page-batch.ts': { count: 1, why: 'batches are never deferred' },
@@ -64,7 +64,7 @@ test('every open-state list of write requests either names deferred or is a reco
   const found: Record<string, number> = {};
   for (const file of walk('src')) {
     const count = readFileSync(file, 'utf8').match(OPEN_WITHOUT_DEFERRED)?.length ?? 0;
-    if (count) found[file] = count;
+    if (count) found[file.split(sep).join('/')] = count;
   }
   const undecided = Object.entries(found).filter(([file, count]) => DECIDED[file]?.count !== count)
     .map(([file, count]) => `${file}: ${count} list(s) without 'deferred' (recorded: ${DECIDED[file]?.count ?? 0})`);
