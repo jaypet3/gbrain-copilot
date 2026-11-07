@@ -24,16 +24,18 @@ export { resolveDateBoundary, resolveSearchDateBounds } from './date-bounds.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
 import { embedQuery } from '../embedding.ts';
 import { loadEmbeddingQueryPrefix } from './query-prefix.ts';
-import { registerBackgroundWorkDrainer } from '../background-work.ts';
+import { deferUntilResponse, registerBackgroundWorkDrainer } from '../background-work.ts';
 import { applyAliasHop, isExcludedIdentity, type IdentityTierOpts } from './alias-hop.ts';
 export { applyAliasHop, isExcludedIdentity, type IdentityTierOpts };
-import { dedupResults } from './dedup.ts';
+import { dedupResults, segmentRegions } from './dedup.ts';
 import { accumulateRrf, type RrfEntry } from './rrf-page-fusion.ts';
 import type { RrfAttribution } from '../types.ts';
 import {
   isAmbiguousModalityQuery,
 } from './query-intent.ts';
-import { isTitlePhraseMatch } from './title-match.ts';
+import { isTitlePhraseMatch, titleNameVariants } from './title-match.ts';
+import { applyGraphSignals, graphSignalPageIds } from './graph-signals.ts';
+import { applyAliasResolvedBoost, readAliasCanonicals } from './hybrid/alias-resolved.ts';
 import {
   textArmsNonEmpty,
   type VectorArm,
@@ -49,8 +51,9 @@ import { prepareSemanticCache, resolveCacheSearchMode, semanticCacheSkipped, ser
 import { buildPostFusionOpts, joinVectorSide, resolveEarlyModality, runLexicalAndRelational, startVectorSide } from './hybrid/arms.ts';
 import { searchVectorFallback, searchWithoutEmbeddings } from './hybrid/keyword-only.ts';
 import { factEmbeddingDisabled } from '../embedding-disabled.ts';
-import { capSessionPool, expandStructuralNeighbors, finalizeHybridResults, fuseArms, rerankAndPin, sizeReturnPool } from './hybrid/rank.ts';
+import { capSessionPool, collapsePool, expandStructuralNeighbors, finalizeHybridResults, fuseArms, rerankAndPin, sizeReturnPool } from './hybrid/rank.ts';
 import { type StageTimer, UNTIMED } from './stage-timings.ts';
+import { needsEngineScope, withEngineScope } from '../engine-scope.ts';
 
 export const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
@@ -396,8 +399,10 @@ export function applyRecencyBoost(
  * T2 (retrieval-maxpool incident) — apply the title-phrase boost.
  *
  * Fires when the normalized query is a contiguous token-run inside a result's
- * page title (or an exact full-title match), per `isTitlePhraseMatch`. Mutate-
- * in-place; caller re-sorts. Mirrors applyBacklinkBoost's floor-gate + stamp.
+ * page title (or an exact full-title match), per `isTitlePhraseMatch`, or a
+ * given-name variant of it does (#7471: "Matt Example" for "Matthew Example",
+ * `titleNameVariants`). Mutate-in-place; caller re-sorts. Mirrors
+ * applyBacklinkBoost's floor-gate + stamp.
  *
  * Bounded by construction: a single fixed multiplier (`factor`, default 1.25),
  * floor-ratio-gated so a title hit on a weak-overlap page can't leapfrog a
@@ -415,11 +420,12 @@ export function applyTitleBoost(
   floorThreshold?: number,
 ): void {
   if (!query || !Number.isFinite(factor) || factor <= 1.0) return;
+  const queries = [query, ...titleNameVariants(query)];
   for (const r of results) {
     if (!Number.isFinite(r.score)) continue;
     if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     if (!r.title) continue;
-    if (isTitlePhraseMatch(query, r.title)) {
+    if (queries.some(q => isTitlePhraseMatch(q, r.title!))) {
       r.score *= factor;
       r.title_match_boost = factor; // attribution stamp (v0.40.4 convention)
     }
@@ -561,17 +567,6 @@ export async function runPostFusionStages(
   // Phase E3 — metadata-axis stages gated as ONE block (see PostFusionOpts).
   const metadata = opts.skipMetadataBoosts !== true;
 
-  // Backlink stage (existing behavior, preserved).
-  if (metadata && opts.applyBacklinks) {
-    try {
-      const pageIds = Array.from(new Set(results.map(r => r.page_id)));
-      const counts = await engine.getBacklinkCounts(pageIds, policy);
-      applyBacklinkBoost(results, counts, floorThreshold);
-    } catch {
-      // Non-fatal; preserves the existing pre-v0.29.1 contract.
-    }
-  }
-
   // Composite refs for the orthogonal axes (multi-source isolation).
   const refs = Array.from(
     new Map(
@@ -579,20 +574,43 @@ export async function runPostFusionStages(
     ).values(),
   );
 
-  // Salience stage (mattering, no time).
-  if (metadata && opts.salience !== 'off') {
+  // Every stage read is keyed by the entry result set (page ids, refs, array
+  // order), never by a score an earlier stage mutates, so all of them start
+  // here instead of costing one round trip each in turn. The stages below
+  // still apply in their fixed order, and a failed read skips only its stage.
+  const backlinkCounts = metadata && opts.applyBacklinks
+    ? startRead(() => engine.getBacklinkCounts(Array.from(new Set(results.map(r => r.page_id))), policy))
+    : undefined;
+  const salienceScores = metadata && opts.salience !== 'off' ? startRead(() => engine.getSalienceScores(refs, policy)) : undefined;
+  const effectiveDates = metadata && opts.recency !== 'off' ? startRead(() => engine.getEffectiveDates(refs, policy)) : undefined;
+  const adjacency = metadata && opts.graphSignalsEnabled
+    ? startRead(() => engine.getAdjacencyBoosts(graphSignalPageIds(results), policy))
+    : undefined;
+  const aliasCanonicals = metadata ? startRead(() => readAliasCanonicals(engine, refs, policy)) : undefined;
+  const supersededBy = startRead(() => readSupersededBy(results, engine, policy));
+
+  // Backlink stage (existing behavior, preserved).
+  if (backlinkCounts) {
     try {
-      const scores = await engine.getSalienceScores(refs, policy);
-      applySalienceBoost(results, scores, opts.salience, floorThreshold);
+      applyBacklinkBoost(results, await backlinkCounts, floorThreshold);
+    } catch {
+      // Non-fatal; preserves the existing pre-v0.29.1 contract.
+    }
+  }
+
+  // Salience stage (mattering, no time).
+  if (salienceScores && opts.salience !== 'off') {
+    try {
+      applySalienceBoost(results, await salienceScores, opts.salience, floorThreshold);
     } catch {
       // Non-fatal.
     }
   }
 
   // Recency stage (per-prefix decay, no mattering).
-  if (metadata && opts.recency !== 'off') {
+  if (effectiveDates && opts.recency !== 'off') {
     try {
-      const dates = await engine.getEffectiveDates(refs, policy);
+      const dates = await effectiveDates;
       // Resolve the effective decay map (defaults + gbrain.yml `recency:` +
       // GBRAIN_RECENCY_DECAY env) instead of the baked-in defaults. The
       // get_recent_salience SQL path already goes through resolveRecencyDecayMap()
@@ -637,13 +655,13 @@ export async function runPostFusionStages(
   // shares the same floor-threshold so a weak hub gets the same
   // protection v0.35.6.0 added for other metadata boosts. Fail-open at
   // this level matches the per-stage non-fatal contract.
-  if (metadata && opts.graphSignalsEnabled) {
+  if (adjacency) {
     try {
-      const { applyGraphSignals } = await import('./graph-signals.ts');
       await applyGraphSignals(results, engine, {
         ...policy,
         enabled: true,
         floorThreshold,
+        adjacencyFn: () => adjacency,
         onMeta: opts.onGraphMeta,
         onScoreDistribution: opts.onScoreDistribution,
       });
@@ -659,9 +677,9 @@ export async function runPostFusionStages(
   // intent: "user explicitly disambiguated this as canonical." Defense-
   // in-depth: pre-v105 brains don't have slug_aliases table; the lookup
   // throws isUndefinedTableError and the stage no-ops.
-  if (metadata) {
+  if (aliasCanonicals) {
     try {
-      await applyAliasResolvedBoost(results, engine, policy);
+      applyAliasResolvedBoost(results, await aliasCanonicals);
     } catch {
       // Non-fatal; preserves the per-stage contract.
     }
@@ -675,10 +693,21 @@ export async function runPostFusionStages(
   // facts. Fail-open per the per-stage contract: a brain with no `supersedes`
   // edges (or a pre-links schema) finds 0 rows / throws and no-ops.
   try {
-    await applySupersedeDownrank(results, engine, policy);
+    stampSuperseded(results, await supersededBy);
   } catch {
     // Non-fatal; preserves the per-stage contract.
   }
+}
+
+/**
+ * Start a stage read now; the stage awaits the promise later. A synchronous
+ * throw becomes a rejection, and the rejection counts as handled until the
+ * stage awaits it, so a read that fails early is not an unhandled rejection.
+ */
+function startRead<T>(read: () => Promise<T>): Promise<T> {
+  const pending = (async () => read())();
+  pending.catch(() => undefined);
+  return pending;
 }
 
 /**
@@ -702,15 +731,20 @@ export function _resetSupersedeProbeForTests(): void {
   supersedeEdgeProbe = new WeakMap();
 }
 
+/**
+ * The supersede-edge probe. `link_type` stays a literal so the planner matches the partial index
+ * idx_links_supersedes_to (migration links_supersedes_index) by its predicate; a bind parameter can leave a generic plan that does not, and with no matching row the
+ * probe would read the whole composite links index (test/e2e/supersedes-probe-index-postgres.test.ts).
+ */
+export const SUPERSEDE_EDGE_PROBE_SQL = `SELECT 1 AS one FROM links WHERE link_type = 'supersedes' LIMIT 1`;
+
 async function hasAnySupersedeEdges(
   engine: import('../engine.ts').BrainEngine,
 ): Promise<boolean> {
   const cached = supersedeEdgeProbe.get(engine);
   if (cached && Date.now() - cached.at < SUPERSEDE_PROBE_TTL_MS) return cached.exists;
   try {
-    const rows = await engine.executeRaw<{ one: number }>(
-      `SELECT 1 AS one FROM links WHERE link_type = 'supersedes' LIMIT 1`,
-    );
+    const rows = await engine.executeRaw<{ one: number }>(SUPERSEDE_EDGE_PROBE_SQL);
     const exists = rows.length > 0;
     supersedeEdgeProbe.set(engine, { at: Date.now(), exists });
     return exists;
@@ -749,12 +783,21 @@ export async function applySupersedeDownrank(
   engine: import('../engine.ts').BrainEngine,
   policy?: PageReadPolicy,
 ): Promise<void> {
-  if (results.length === 0) return;
+  stampSuperseded(results, await readSupersededBy(results, engine, policy));
+}
+
+/** Superseded page id → the superseding page's slug, for the results' pages; empty when the stage no-ops. */
+async function readSupersededBy(
+  results: SearchResult[],
+  engine: import('../engine.ts').BrainEngine,
+  policy?: PageReadPolicy,
+): Promise<Map<number, string>> {
+  const supersededBy = new Map<number, string>();
   const pageIds = Array.from(
     new Set(results.map(r => r.page_id).filter((id): id is number => typeof id === 'number')),
   );
-  if (pageIds.length === 0) return;
-  if (!(await hasAnySupersedeEdges(engine))) return;
+  if (pageIds.length === 0) return supersededBy;
+  if (!(await hasAnySupersedeEdges(engine))) return supersededBy;
   const params: unknown[] = [pageIds];
   const fromFilter = pageReadFilter('pf', policy, params, !!policy);
   const toFilter = pageReadFilter('pt', policy, params, !!policy);
@@ -775,14 +818,16 @@ export async function applySupersedeDownrank(
     );
   } catch {
     // Pre-links schema or SQL miss; no-op.
-    return;
+    return supersededBy;
   }
-  if (rows.length === 0) return;
-  const supersededBy = new Map<number, string>();
   for (const row of rows) {
     const id = Number(row.to_page_id);
     if (!supersededBy.has(id)) supersededBy.set(id, row.by_slug);
   }
+  return supersededBy;
+}
+
+function stampSuperseded(results: SearchResult[], supersededBy: Map<number, string>): void {
   for (const r of results) {
     const by = supersededBy.get(r.page_id);
     if (by !== undefined) {
@@ -790,66 +835,6 @@ export async function applySupersedeDownrank(
       r.superseded = true;
       r.superseded_by = by;
       r.supersede_penalty = SUPERSEDE_PENALTY;
-    }
-  }
-}
-
-/**
- * v0.42 (T19) — apply 1.05x boost to results whose slug is a canonical_slug
- * in slug_aliases. Stamps `alias_resolved_boost` on touched results so
- * --explain can render the contribution.
- *
- * Single index-hit query bounded by top-K (slug_aliases is small relative
- * to the result set; ALIASES <<< PAGES even on the 186K-page production
- * brain where 5.5K aliases is ~3% of pages).
- *
- * Source-scoped (codex F9: keyed by {source_id, slug} not just slug).
- */
-const ALIAS_RESOLVED_BOOST = 1.05;
-
-async function applyAliasResolvedBoost(
-  results: SearchResult[],
-  engine: import('../engine.ts').BrainEngine,
-  policy?: PageReadPolicy,
-): Promise<void> {
-  if (results.length === 0) return;
-  // Build the (source_id, slug) composite list for the lookup.
-  const refs = Array.from(
-    new Map(
-      results.map(r => [
-        `${r.source_id ?? 'default'}::${r.slug}`,
-        { slug: r.slug, source_id: r.source_id ?? 'default' },
-      ]),
-    ).values(),
-  );
-  if (refs.length === 0) return;
-  // Find which refs are canonical of any slug_aliases row.
-  // Two-array unnest for source-scoped composite lookup.
-  const sourceIds = refs.map(r => r.source_id);
-  const slugs = refs.map(r => r.slug);
-  const params: unknown[] = [sourceIds, slugs];
-  const filter = pageReadFilter('p', policy, params, !!policy);
-  let rows: Array<{ source_id: string; canonical_slug: string }> = [];
-  try {
-    rows = await engine.executeRaw<{ source_id: string; canonical_slug: string }>(
-      `SELECT DISTINCT a.source_id, a.canonical_slug
-       FROM slug_aliases a JOIN pages p ON p.source_id = a.source_id AND p.slug = a.canonical_slug
-       WHERE (a.source_id, a.canonical_slug) IN (
-         SELECT * FROM unnest($1::text[], $2::text[])
-       ) AND ${filter}`,
-      params,
-    );
-  } catch {
-    // Pre-v104 brain or other SQL miss; no-op.
-    return;
-  }
-  if (rows.length === 0) return;
-  const canonicalSet = new Set(rows.map(r => `${r.source_id}::${r.canonical_slug}`));
-  for (const r of results) {
-    const key = `${r.source_id ?? 'default'}::${r.slug}`;
-    if (canonicalSet.has(key)) {
-      r.score *= ALIAS_RESOLVED_BOOST;
-      r.alias_resolved_boost = ALIAS_RESOLVED_BOOST;
     }
   }
 }
@@ -1097,6 +1082,7 @@ export async function hybridSearch(
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
   if (opts?.types?.length === 0) return [];
+  if (needsEngineScope(engine)) return withEngineScope(engine, () => hybridSearch(engine, query, opts));
   const timer = opts?._timings ?? UNTIMED;
   if (opts?.type || opts?.types?.length) {
     const { expandEngineTypeFilters } = await import('../schema-pack/query-types.ts');
@@ -1170,7 +1156,7 @@ export async function hybridSearch(
   // aliasing in the postFusionOpts resolver near line ~256.
 
   // Dedup
-  const deduped = await timer.stage('post_fusion', async () => capSessionPool(req, dedupResults(fused, dedupOpts)));
+  const deduped = await timer.stage('post_fusion', async () => collapsePool(req, capSessionPool(req, dedupResults(fused, { ...dedupOpts, regions: await segmentRegions(req.engine, fused) }))));
   opts?.explainTarget?.observe('deduped', deduped);
 
   // Auto-escalate: if detail=low returned 0, retry with high. The inner
@@ -1185,7 +1171,7 @@ export async function hybridSearch(
   }));
   opts?.explainTarget?.observe('reranked', rerankPinned);
   const { returnPool, adaptiveDecision, autocutDecision, relationalSlotDecision } = await timer.stage('post_fusion', () => sizeReturnPool(req, {
-    rerankPinned, deduped, exactLookupOpts: lexical.exactLookupOpts, relationalList, effectiveModality, identityLookups,
+    rerankPinned, deduped, relationalList, effectiveModality, identityLookups,
   }));
   opts?.explainTarget?.observe('return_pool', returnPool);
   return timer.stage('post_fusion', () => finalizeHybridResults(req, returnPool, {
@@ -1222,6 +1208,7 @@ export async function hybridSearchCached(
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
   if (opts?.types?.length === 0) return [];
+  if (needsEngineScope(engine)) return withEngineScope(engine, () => hybridSearchCached(engine, query, opts));
   const timer = opts?._timings ?? UNTIMED;
   const { modeInputForCache, resolvedForCache, knobsHash } = await timer.stage('setup', () => resolveCacheSearchMode(engine, opts));
   const queryPrefix = opts?._queryPrefix ?? await timer.stage('setup', () => loadEmbeddingQueryPrefix(engine));
@@ -1365,7 +1352,7 @@ export async function hybridSearchCached(
     // every 60s); the stamp still rides the stored meta so a hit is honest.
     // Stale unreranked rows after a key appears expire within one TTL.
     const isDegraded = (finalMeta.degraded ?? []).some(affectsRecall);
-    trackCacheWrite(
+    deferUntilResponse(() => trackCacheWrite(
       semanticCache.cache
         .store(query, queryEmbedding, results, finalMeta, {
           sourceId: cacheScopeKey(opts),
@@ -1373,7 +1360,7 @@ export async function hybridSearchCached(
           ...(isDegraded ? { ttlSeconds: DEGRADED_CACHE_TTL_SECONDS } : {}),
         })
         .catch(() => { /* swallow */ }),
-    );
+    ));
   }
 
   return budgeted;
@@ -1558,91 +1545,5 @@ export function rrfFusion(lists: SearchResult[][], k: number, applyBoost = true)
         : { ...result, score });
 }
 
-/**
- * Cosine re-scoring: blend RRF score with query-chunk cosine similarity.
- * Runs before dedup so semantically better chunks survive.
- *
- * Exported (only) for direct unit testing of the chunkless-row blend fix
- * (#3695) — not part of the public search API surface.
- */
-export async function cosineReScore(
-  engine: BrainEngine,
-  results: SearchResult[],
-  queryEmbedding: Float32Array,
-  column: string = 'embedding',
-  imageSpace?: { queryEmbedding: Float32Array; column: string },
-  attribute = false,
-): Promise<SearchResult[]> {
-  // 'both' mode: image-arm rows live in the image space (image column,
-  // multimodal query vector); everything else in the text space.
-  const inImageSpace = (r: SearchResult): boolean => imageSpace !== undefined && r.modality === 'image';
-  const idsFor = (image: boolean) => results
-    .filter(r => inImageSpace(r) === image)
-    .map(r => r.chunk_id)
-    .filter((id): id is number => id != null);
-  const chunkIds = idsFor(false);
-  const imageChunkIds = idsFor(true);
-
-  if (chunkIds.length === 0 && imageChunkIds.length === 0) return results;
-
-  let embeddingMap: Map<number, Float32Array>;
-  let imageEmbeddingMap = new Map<number, Float32Array>();
-  try {
-    // v0.36 (D9): hydrate from the active column so rescore happens in
-    // the same embedding space the HNSW just ranked in. Without this,
-    // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
-    // rescore against OpenAI vectors → NaN or wrong rankings.
-    embeddingMap = chunkIds.length > 0 ? await engine.getEmbeddingsByChunkIds(chunkIds, column) : new Map();
-    if (imageSpace && imageChunkIds.length > 0) {
-      imageEmbeddingMap = await engine.getEmbeddingsByChunkIds(imageChunkIds, imageSpace.column);
-    }
-  } catch {
-    // DB error is non-fatal, return results without re-scoring
-    return results;
-  }
-
-  if (embeddingMap.size === 0 && imageEmbeddingMap.size === 0) return results;
-
-  // Normalize RRF scores to 0-1 for blending
-  const maxRrf = Math.max(...results.map(r => r.score));
-
-  return results.map(r => {
-    // v0.46.28.0 (#3695): a row with no hydratable chunk embedding (the
-    // synthetic chunkless row for an embed_skip'd oversized page, or a
-    // chunk_id whose embedding didn't hydrate) used to return `r` untouched
-    // — keeping its RAW post-RRF score on a [0, ~2.0] scale while every
-    // other row got compressed onto the [0, 1.0] blended scale below. That
-    // gave chunkless rows a structural 2x head start (#3695's reported
-    // symptom: an empty-snippet embed_skip page outranking on-point
-    // results). Route it through the SAME blend with cosine=0 instead of
-    // excluding it — excluding would make embed_skip pages unsearchable,
-    // a different (undesired) behavior change.
-    const image = inImageSpace(r);
-    const chunkEmb = r.chunk_id != null ? (image ? imageEmbeddingMap : embeddingMap).get(r.chunk_id) : undefined;
-    const cosine = chunkEmb ? cosineSimilarity(image ? imageSpace!.queryEmbedding : queryEmbedding, chunkEmb) : 0;
-    const normRrf = maxRrf > 0 ? r.score / maxRrf : 0;
-    const blended = 0.7 * normRrf + 0.3 * cosine;
-
-    if (DEBUG) {
-      console.error(`[search-debug] ${r.slug}:${r.chunk_id} cosine=${cosine.toFixed(4)} norm_rrf=${normRrf.toFixed(4)} blended=${blended.toFixed(4)}`);
-    }
-
-    // v0.46.15: stamp the raw cosine — evidence + --explain read it (the
-    // hydration map is already paid for; zero extra probes).
-    return { ...r, score: blended, cosine, ...(attribute ? { blend_norm_rrf: normRrf } : {}) };
-  }).sort((a, b) => b.score - a.score);
-}
-
-export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  // Vectors from different embedding spaces are incomparable: a length
-  // mismatch used to yield a truncated dot product or NaN.
-  if (a.length !== b.length) return 0;
-  let dot = 0, magA = 0, magB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    magA += a[i] * a[i];
-    magB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(magA) * Math.sqrt(magB);
-  return denom === 0 ? 0 : dot / denom;
-}
+/** Cosine re-scoring (search/cosine-rescore.ts); re-exported for the existing importers. */
+export { cosineReScore, cosineSimilarity } from './cosine-rescore.ts';

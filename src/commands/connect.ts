@@ -48,6 +48,12 @@ import type { ConnectProbeResult } from '../core/connect-probe.ts';
 import { probeBrainIdentity, DEFAULT_PROBE_TIMEOUT_MS } from '../core/connect-probe.ts';
 import { opencodeGlobalConfigPath } from '../core/bootstrap/host-specs.ts';
 import { acquireBootstrapLock } from '../core/bootstrap/lock.ts';
+import { brainFirstTarget, describeBrainFirstOutcome, installerBrainFirst, isBrainFirstHarness, priorBrainFirst } from '../core/setup/brain-first.ts';
+import { describeTurnHookOutcome } from '../core/setup/turn-hook.ts';
+import { installerTurnHook, TURN_HOOK_NATIVE_INSPECT, turnHookFix } from '../core/setup/turn-hook-check.ts';
+import { resolveGbrainBin } from '../core/gbrain-bin.ts';
+import { describeSkillsBlockOutcome, indexLauncher, installerSkillsBlock, isSkillLoading, skillsOutcomeFailed, skillsOutcomeShown, type SkillLoading } from '../core/setup/skills-block.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import {
   GBRAIN_REMOTE_TOKEN_ENV,
   reconcileOpencodeSiblingGlobal,
@@ -187,7 +193,15 @@ Flags:
   --install            Run the agent's MCP-add command, then smoke-test the token
                        (claude-code + codex + opencode + copilot; opencode installs via a
                        direct config write — no binary needed, token stays out of the
-                       file; copilot merges into ~/.copilot/mcp-config.json, token included)
+                       file; copilot merges into ~/.copilot/mcp-config.json, token included).
+                       Also writes the brain-first instruction block into the agent's
+                       own instruction file (CLAUDE.md / AGENTS.md)
+  --no-instructions    With --install, skip (and remove) the brain-first block
+  --skill-loading M    With --install: off (default) or spring, a compact index of
+                       gbrain's bundled skills beside that block, each loaded on
+                       demand with gbrain bundled-skill <name>. Remembered.
+  --gbrain-bin PATH    With --skill-loading spring: the absolute gbrain the index
+                       names (default: this gbrain, else the one on PATH).
   --yes                The user's approval for --install (writes a credential-
                        bearing MCP entry); without it a non-interactive run exits 3
   --force              On --install, replace an existing server of the same name
@@ -545,6 +559,10 @@ export interface ConnectDeps {
     url: string,
     opts?: { allowReplaceOtherSource?: boolean },
   ): { configPath: string; replacedPrior: boolean } | Promise<{ configPath: string; replacedPrior: boolean }>;
+  /** After a successful registration: the brain-first block in the agent's own instruction file. Returns the line to print. */
+  writeInstructions(agent: AgentId, name: string, optOut: boolean, skillLoading?: SkillLoading, gbrainBin?: string): string | null;
+  /** After the block: the per-turn hook that puts the rule next to every turn (src/core/setup/turn-hook.ts). `ok: false` fails the install loudly. */
+  writeTurnHook(agent: AgentId): { lines: string[]; ok: boolean };
 }
 
 async function defaultPromptYesNo(question: string): Promise<boolean> {
@@ -613,6 +631,28 @@ const defaultDeps: ConnectDeps = {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, content, 'utf-8');
   },
+  writeInstructions: (agent, name, optOut, skillLoading, gbrainBin) => {
+    if (!isBrainFirstHarness(agent)) return null;
+    const target = brainFirstTarget(agent);
+    if ('error' in target) return null;
+    const writer = `gbrain connect --agent ${agent} --install`;
+    const o = installerBrainFirst({ target, access: { kind: 'mcp', server: name }, writer, instructions: optOut ? false : undefined });
+    const skills = installerSkillsBlock({ target, launcher: gbrainBin ?? indexLauncher() ?? 'gbrain', writer, brainFirstDeclined: o.decision.value === 'declined', skillLoading, audience: 'downstream' });
+    const lines = [`${describeBrainFirstOutcome(o, false).trim()}${o.decision.value === 'accepted' ? ' (opt out with --no-instructions)' : ''}`];
+    if (skillsOutcomeShown(skills)) lines.push(describeSkillsBlockOutcome(skills, false).trim());
+    if (skillsOutcomeFailed(skills)) setCliExitVerdict(1);
+    return lines.join('\n');
+  },
+  writeTurnHook: (agent) => {
+    const target = isBrainFirstHarness(agent) ? brainFirstTarget(agent) : null;
+    const accepted = !!target && !('error' in target) && priorBrainFirst(agent, target.path)?.status === 'installed' && process.env.GBRAIN_AGENT_INSTRUCTIONS !== '0';
+    const rerun = ['gbrain', 'setup', agent, '--instructions-only'];
+    const { outcome, verdict } = installerTurnHook({ harness: agent, accepted, gbrainBin: resolveGbrainBin(), gbrainHome: process.env.GBRAIN_HOME?.trim() || undefined, rerun: rerun.join(' ') });
+    const lines = [describeTurnHookOutcome(outcome).trim()];
+    if (!verdict || verdict.ok) return { lines: verdict ? [...lines, `verify   turn hook ${verdict.message}`] : lines, ok: true };
+    const fix = turnHookFix(agent, rerun);
+    return { lines: [...lines, `error turn_hook_not_loaded (${verdict.reason}): the per-turn gbrain hook is not active: ${verdict.message}. Fix: ${rerun.join(' ')}. Verify: ${fix.verify?.argv?.join(' ')}${TURN_HOOK_NATIVE_INSPECT[agent] ? `; the harness's own check: ${TURN_HOOK_NATIVE_INSPECT[agent]}` : ''}.`], ok: false };
+  },
   writeOpencodeRemoteEntry: async (name, url, opts) => {
     // The writer's contract: callers hold acquireBootstrapLock on the config
     // dir (harness.ts [X11] parity) — the user-global file is shared across
@@ -659,6 +699,9 @@ interface ParsedFlags {
   force: boolean;
   json: boolean;
   showToken: boolean;
+  noInstructions: boolean;
+  skillLoading?: SkillLoading;
+  gbrainBin?: string;
   timeoutMs: number;
   help: boolean;
   agentError?: string;
@@ -677,6 +720,7 @@ function parseArgs(args: string[]): ParsedFlags {
     force: false,
     json: false,
     showToken: false,
+    noInstructions: false,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     help: false,
   };
@@ -705,6 +749,15 @@ function parseArgs(args: string[]): ParsedFlags {
       case '--force': out.force = true; break;
       case '--json': out.json = true; break;
       case '--show-token': out.showToken = true; break;
+      case '--no-instructions': out.noInstructions = true; break;
+      case '--gbrain-bin': { const v = takeValue('--gbrain-bin'); if (v !== undefined) out.gbrainBin = v; break; }
+      case '--skill-loading': {
+        const v = takeValue('--skill-loading');
+        if (v === undefined) break;
+        if (isSkillLoading(v)) out.skillLoading = v;
+        else out.agentError = out.agentError ?? `Unknown --skill-loading '${v}'. Use off or spring.`;
+        break;
+      }
       case '--token': { const v = takeValue('--token'); if (v !== undefined) out.token = v; break; }
       case '--client-id': { const v = takeValue('--client-id'); if (v !== undefined) out.clientId = v; break; }
       case '--client-secret': { const v = takeValue('--client-secret'); if (v !== undefined) out.clientSecret = v; break; }
@@ -911,6 +964,9 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
       `Added MCP entry '${f.name}' -> ${url} in ${w.configPath}` +
         `${w.replacedPrior ? ' (replaced the prior gbrain entry)' : ''}. Restart opencode (config is read at session start).`,
     );
+    const ocInstructions = deps.writeInstructions(f.agent, f.name, f.noInstructions, f.skillLoading, f.gbrainBin);
+    if (ocInstructions) console.error(ocInstructions);
+    for (const line of deps.writeTurnHook(f.agent).lines) console.error(line);
     if (deps.env(ENV_VAR) !== realToken) {
       console.error(`opencode resolves {env:${ENV_VAR}} at read time. Add this to your shell profile so sessions can reach the brain:`);
       console.error(`  export ${ENV_VAR}=<your-token>`);
@@ -959,6 +1015,10 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
     fail(`'${binary} mcp add' failed${note}: ${redactToken(add.stderr || add.stdout, realToken)}`);
   }
   console.error(`Added MCP server '${f.name}' -> ${url}.`);
+  const instructions = deps.writeInstructions(f.agent, f.name, f.noInstructions, f.skillLoading, f.gbrainBin);
+  if (instructions) console.error(instructions);
+  const turnHook = deps.writeTurnHook(f.agent);
+  for (const line of turnHook.lines) console.error(line);
 
   // Codex reads the token from the env var at runtime, not from its config.
   // If the current env doesn't already carry it, the user must export it.
@@ -974,6 +1034,7 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
     console.error(`Verified: ${probe.identity || 'brain reachable'}`);
     console.error('');
     console.error(LEARN_INSTRUCTION);
+    if (!turnHook.ok) process.exit(1);
     return;
   }
   // Server is registered, but end-to-end auth did not verify. Exit non-zero so

@@ -20,8 +20,11 @@ export const DEFAULT_BRANCH = 'main';
 export const GITHUB_URL = `https://github.com/${GITHUB_REPO}`;
 export const RELEASES_URL = `${GITHUB_URL}/releases`;
 export const ISSUES_URL = `${GITHUB_URL}/issues`;
-export const RELEASES_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
-export const RAW_BASE_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${DEFAULT_BRANCH}`;
+export const RELEASES_API_BASE = `https://api.github.com/repos/${GITHUB_REPO}/releases`;
+export const RELEASES_API_URL = `${RELEASES_API_BASE}/latest`;
+/** Raw-file base URL at any ref (branch or tag) of GITHUB_REPO. */
+export const rawUrlAt = (ref: string): string => `https://raw.githubusercontent.com/${GITHUB_REPO}/${ref}`;
+export const RAW_BASE_URL = rawUrlAt(DEFAULT_BRANCH);
 
 /**
  * Repo slugs accepted by install-authenticity checks (bun-link detection and

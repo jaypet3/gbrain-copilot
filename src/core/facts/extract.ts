@@ -4,13 +4,15 @@
  * Pure function: given a conversation turn, return an array of NewFact rows
  * ready for the engine.insertFact path. Pipeline:
  *
- *   1. Sanitize turn_text via INJECTION_PATTERNS (reuses the takes/think
- *      sanitizer — single source of truth for prompt-injection defense).
+ *   1. Neutralize injection in the prompt copy of turn_text via
+ *      INJECTION_PATTERNS (reuses the takes/think sanitizer — single source
+ *      of truth for prompt-injection defense).
  *   2. Anti-loop check: if the turn was sourced from a `dream_generated:true`
  *      page, skip (returns []).
  *   3. Call Haiku via `gateway.chat()` with a tight extraction prompt.
  *   4. Parse the strict-JSON response (4-strategy fallback for malformed).
- *   5. Sanitize each extracted fact's text on the way OUT.
+ *   5. Restore, from the raw turn, any neutralized span the model copied into
+ *      a fact (#7125): stored text is never rewritten by the sanitizer.
  *   6. Compute embeddings synchronously per-fact via `gateway.embed()` so
  *      classifier paths have them available immediately.
  *   7. Return an array of NewFact for the caller to insert.
@@ -26,7 +28,7 @@ import { chat, embedOne, isAvailable, getEmbeddingModel } from '../ai/gateway.ts
 import { classifyGlobalLlmError } from '../ai/errors.ts';
 import { stripReasoningBlocks } from '../llm-json.ts';
 import type { ChatResult } from '../ai/gateway.ts';
-import { INJECTION_PATTERNS } from '../think/sanitize.ts';
+import { INJECTION_PATTERNS, restoreNeutralized } from '../think/sanitize.ts';
 import { resolveModelDetailed, type ResolveSource } from '../model-config.ts';
 import { normalizeModelId, splitProviderModelId } from '../model-id.ts';
 import type { BrainEngine, NewFact, FactKind, FactAttribution } from '../engine.ts';
@@ -268,6 +270,8 @@ export interface ExtractInput {
   sessionId?: string | null;
   /** Existing canonical entity slugs the agent already resolved (D4 hint). */
   entityHints?: string[];
+  /** Hints the prompt forwards; defaults to ENTITY_HINTS_CAP (the extract_facts contract). */
+  entityHintsCap?: number;
   /** Source identifier for provenance — e.g. 'mcp:put_page' or 'mcp:extract_facts'. */
   source: string;
   /**
@@ -292,6 +296,8 @@ export interface ExtractInput {
   observationDate?: ObservationDate | null;
   /** Prompt variant; undefined → read `extraction.date_grounding` / `facts.attribution` from config. */
   variant?: ExtractorVariant;
+  /** #8064: the agent (session-speaker label) that wrote the turn's user side; the owner when absent. */
+  userSpeaker?: string;
   /** Optional pre-embedding admission selector for extracted fact tiers. */
   notabilityAdmission?: {
     allowed: readonly FactNotability[];
@@ -604,8 +610,9 @@ export async function extractFactsFromTurnWithOutcome(
   if (input.isDreamGenerated) return { ok: true, facts: [] };
   if (!input.turnText) return { ok: true, facts: [] };
 
-  // Anti-loop + sanitization.
-  let cleaned = input.turnText.slice(0, MAX_TURN_TEXT_CHARS);
+  // Anti-loop + sanitization of the prompt copy only (#7125).
+  const rawTurn = input.turnText.slice(0, MAX_TURN_TEXT_CHARS);
+  let cleaned = rawTurn;
   for (const p of INJECTION_PATTERNS) cleaned = cleaned.replace(p.rx, p.replacement);
   cleaned = cleaned.trim();
   if (!cleaned) return { ok: true, facts: [] };
@@ -647,9 +654,12 @@ export async function extractFactsFromTurnWithOutcome(
     : buildExtractorSystem(admitsLow, variant);
   const responseSchema = factsResponseSchema(variant);
   const dateLine = variant.dateGrounding ? `${observationDateLine(input.observationDate ?? null)}\n` : '';
-  const userContent = `${dateLine}<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
+  const speakerLine = input.userSpeaker
+    ? `The user turns below were written by the automated agent "${input.userSpeaker}", not by the brain's owner: phrase their claims as "Agent ${input.userSpeaker} …" and attribute them "other".\n`
+    : '';
+  const userContent = `${dateLine}${speakerLine}<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
     input.entityHints && input.entityHints.length
-      ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, ENTITY_HINTS_CAP).join(', ')}.`
+      ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, input.entityHintsCap ?? ENTITY_HINTS_CAP).join(', ')}.`
       : ''
   }`;
   let result: ChatResult;
@@ -665,6 +675,10 @@ export async function extractFactsFromTurnWithOutcome(
       maxTokens,
       abortSignal: input.abortSignal,
       responseSchema,
+      // The system prompt is identical across consecutive calls (everything
+      // per-call rides in userContent), so bulk extraction reads it from the
+      // provider's prompt cache instead of paying full input for it each time.
+      cacheSystem: true,
     });
     // #2113: never checked pre-fix — a truncated response (stopReason
     // 'length', e.g. reasoning tokens eating the cap on mandatory-reasoning
@@ -683,6 +697,7 @@ export async function extractFactsFromTurnWithOutcome(
         maxTokens: effectiveMaxTokens,
         abortSignal: input.abortSignal,
         responseSchema,
+        cacheSystem: true,
       });
       if (result.stopReason === 'length') {
         process.stderr.write(
@@ -716,6 +731,8 @@ export async function extractFactsFromTurnWithOutcome(
       'retrying once with an explicit JSON-only reminder\n',
     );
     try {
+      // No cacheSystem: the appended note makes this system block differ from
+      // every other call's, so a cache write here would never be read.
       result = await chat({
         model,
         system: `${extractorSystem}\nThe previous attempt returned invalid JSON or an invalid facts schema. ` +
@@ -771,10 +788,11 @@ export async function extractFactsFromTurnWithOutcome(
       e.name = 'AbortError';
       throw e;
     }
-    let factText = candidate.fact.trim();
+    // #7125: the fact is stored, so it is never rewritten by the sanitizer; a
+    // neutralized span the model copied from the prompt is restored from the
+    // raw turn when the turn proves it. Prompt renderers neutralize on output.
+    let factText = restoreNeutralized(candidate.fact.trim(), rawTurn).text;
     if (!factText) continue;
-    // Sanitize on the way OUT too.
-    for (const p of INJECTION_PATTERNS) factText = factText.replace(p.rx, p.replacement);
     if (factText.length > 500) factText = factText.slice(0, 497) + '...';
     const kind = ALL_EXTRACT_KINDS.includes(candidate.kind as FactKind)
       ? (candidate.kind as FactKind)

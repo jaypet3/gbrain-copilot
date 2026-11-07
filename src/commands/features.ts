@@ -5,6 +5,7 @@
  *   gbrain features [--json] [--auto-fix] [--help]
  */
 
+import { gbrainPath } from '../core/config.ts';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -61,9 +62,7 @@ export const RECIPE_META = [
 // --- Persistence ---
 
 function offersPath(): string {
-  // HOME first (tests mutate it), homedir() fallback (Windows PowerShell
-  // leaves HOME unset) — same pattern as core/preferences.ts.
-  return join(process.env.HOME || homedir(), '.gbrain', 'feature-offers.json');
+  return gbrainPath('feature-offers.json');
 }
 
 function loadOffers(): FeatureOffersFile {
@@ -77,8 +76,7 @@ function loadOffers(): FeatureOffersFile {
 
 function saveOffers(offers: FeatureOffersFile) {
   try {
-    const dir = join(process.env.HOME || homedir(), '.gbrain');
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(gbrainPath(), { recursive: true });
     writeFileSync(offersPath(), JSON.stringify(offers, null, 2));
   } catch { /* best-effort */ }
 }

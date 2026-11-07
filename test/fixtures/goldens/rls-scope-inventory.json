@@ -159,6 +159,32 @@
           "src-a"
         ]
       },
+      "countPagesBy#grouped+since+remote": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
+      "countPagesBy#totals": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "*"
+        ]
+      },
       "countStaleChunks#default": {
         "flagOffLanes": [
           "pool"
@@ -591,6 +617,32 @@
           "pool"
         ],
         "flagOnScopes": []
+      },
+      "findPages#glob+types+sourceIds+remote": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a,src-b"
+        ]
+      },
+      "findPages#name": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "*"
+        ]
       },
       "findTrajectory#default": {
         "flagOffLanes": [
@@ -2484,12 +2536,12 @@
       },
       "purgeDeletedPages#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -2851,23 +2903,23 @@
       },
       "restorePage#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
       "restorePage#sourceId": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -3390,23 +3442,28 @@
           "tx>sp"
         ],
         "flagOffOpensTransaction": true,
-        "flagOn": "unscoped",
+        "flagOn": "scoped",
         "flagOnLanes": [
           "tx",
           "tx>sp"
         ],
-        "flagOnScopes": []
+        "flagOnScopes": [
+          "src-a"
+        ]
       },
       "updateSlug#noop": {
         "flagOffLanes": [
           "tx"
         ],
         "flagOffOpensTransaction": true,
-        "flagOn": "unscoped",
+        "flagOn": "scoped",
         "flagOnLanes": [
-          "tx"
+          "tx",
+          "tx>sp"
         ],
-        "flagOnScopes": []
+        "flagOnScopes": [
+          "default"
+        ]
       },
       "updateSourceConfig#default": {
         "flagOffLanes": [
@@ -3545,22 +3602,25 @@
       }
     },
     "static": {
-      "callSites": 32,
+      "callSites": 36,
       "directMethods": {
         "_searchKeywordCJK": 1,
         "countChunklessPagesWithContent": 1,
         "countKeywordPages": 1,
+        "countPagesBy": 1,
         "countStaleChunks": 1,
         "countStaleFrontmatterKeyPages": 1,
         "countStalePagesForExtraction": 1,
         "findDuplicatePage": 1,
         "findDuplicatePages": 1,
+        "findPages": 1,
         "getAllSlugs": 1,
         "getBacklinks": 1,
         "getChunkPage": 1,
         "getChunkWindows": 1,
         "getChunks": 1,
         "getLinks": 1,
+        "keywordBoundedRead": 1,
         "listChunklessPagesWithContent": 1,
         "listCorpusSample": 1,
         "listEmbeddingStateRows": 1,
@@ -3574,7 +3634,7 @@
         "readPageSnapshot": 1,
         "readPageSnapshotsBatch": 1,
         "runVectorAttempt": 1,
-        "searchKeyword": 1,
+        "searchKeyword": 2,
         "searchKeywordChunks": 1,
         "searchKeywordPages": 1,
         "searchTitles": 1,
@@ -3599,9 +3659,11 @@
         "batchRetry": "none",
         "connRetry": "none",
         "connect": "none",
+        "connectedDatabaseUrl": "none",
         "consolidateFact": "none",
         "countChunklessPagesWithContent": "direct",
         "countKeywordPages": "direct",
+        "countPagesBy": "direct",
         "countStaleChunks": "direct",
         "countStaleFrontmatterKeyPages": "direct",
         "countStalePagesForExtraction": "direct",
@@ -3631,6 +3693,7 @@
         "findDuplicatePages": "direct",
         "findOntologyConflicts": "none",
         "findOrphanPages": "none",
+        "findPages": "direct",
         "findTrajectory": "none",
         "flipBodyGeneration": "none",
         "getAdjacencyBoosts": "none",
@@ -3682,6 +3745,7 @@
         "invalidateContentDriftEmbeddings": "none",
         "invalidateStaleSignatureEmbeddings": "none",
         "jitOffRead": "none",
+        "keywordBoundedRead": "direct",
         "keywordStatementTimeoutSetting": "none",
         "listActiveTakesForPages": "none",
         "listAllPageRefs": "none",
@@ -3727,7 +3791,9 @@
         "readManifest": "none",
         "readPageSnapshot": "direct",
         "readPageSnapshotsBatch": "direct",
+        "readSegmentDerivations": "none",
         "readSegmentTexts": "none",
+        "readTransaction": "none",
         "reconnect": "none",
         "refreshPageBody": "none",
         "registerBeforeDisconnect": "none",
@@ -3746,6 +3812,7 @@
         "resolveSlugsByPaths": "none",
         "resolveTake": "none",
         "restorePage": "none",
+        "retireSegmentDerivations": "none",
         "revertToVersion": "none",
         "rewriteLinks": "none",
         "rlsScopeBindingEnabled": "none",
@@ -3791,6 +3858,7 @@
         "upsertChunks": "via:_upsertChunksOnce",
         "upsertEventProjection": "none",
         "upsertFile": "none",
+        "upsertSegmentDerivations": "none",
         "vectorIterativeScanSupported": "none",
         "withReservedConnection": "none",
         "withScopedReadTransaction": "none",

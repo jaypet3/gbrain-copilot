@@ -6,9 +6,10 @@ import { isImageFilePath, type ImportResult } from '../import-file.ts';
 import { loadConfig } from '../config.ts';
 import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
-import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission } from './page-mutations.ts';
+import { SCREENING_SHARED_READS, batchSharedReads, emitFenceNotice, initializeLocalPersistence, pendingAwareResponse, preparePageAdmission, requestPrincipalForContext, withBatchAdmission,
+  withLiveSearchable } from './page-mutations.ts';
 import { admitBatch } from './page-batch.ts';
 import { writeOutcomeUnknown } from './admission-retry.ts';
 import { assertPersistenceAccepting, waitForWrites } from './service.ts';
@@ -100,7 +101,7 @@ export async function importManagedFiles(engine: BrainEngine, files: readonly Ma
   const fail = (i: number, reason: unknown) => { settled[i] = { status: 'rejected', reason }; };
   const sourceId = opts.sourceId ?? 'default';
   const binding = await getWorktreeBinding(engine, sourceId);
-  const unowned = !binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active'
+  const unowned = !binding?.local_path || binding.owner_host_id !== hostIdFor(engine) || binding.state !== 'active'
     ? opError('owner_unavailable', 'Managed import must run on the active canonical owner for the selected source.',
       `This host is not the active owner of source ${sourceId}, so nothing was imported. Run the import on the owner host that writer status names, or wait until its owner is active.`,
       { fix: readFix(`Shows source ${sourceId}'s owner host and state, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] }) }) : null;
@@ -126,7 +127,7 @@ export async function importManagedFiles(engine: BrainEngine, files: readonly Ma
       const path = canonicalInput ? canonicalRelative : sourcePath;
       const target = resolve(root, path);
       await assertImportPaths(reads, sourceId, root, inputPath, target);
-      const streamed = await managedStreamedIdentity(sourcePath, inputPath, target, bodyPolicy);
+      const streamed = await managedStreamedIdentity(sourcePath, inputPath, target, bodyPolicy, sourceId);
       const bytes = streamed ? null : readImportBytes(inputPath);
       const { slug, content } = streamed ? { slug: streamed.slug, content: undefined } : managedImportContent(sourcePath, bytes!, opts.activePack);
       if (slugs.has(slug)) { rest = i; break; }
@@ -213,6 +214,9 @@ async function importPlanned(ctx: OperationContext, binding: WorktreeBinding,
       const value = outcome.value;
       done(member.i, { slug: String(value.slug), status: value.status as ImportResult['status'], chunks: Number(value.chunks ?? 0),
         ...(typeof value.error === 'string' ? { error: value.error } : {}),
+        ...(value.searchable !== undefined ? { searchable: value.searchable as ImportResult['searchable'] } : {}),
+        ...(value.searchable === 'pending' ? { projection: 'pending' as const, request_id: String(value.request_id),
+          searchable_retry_after_ms: Number(value.searchable_retry_after_ms), searchable_fix: value.searchable_fix as ImportResult['searchable_fix'] } : {}),
         ...(value.type_warning ? { type_warning: value.type_warning as ImportResult['type_warning'] } : {}) });
       return;
     }
@@ -266,14 +270,15 @@ async function submitManagedImports(ctx: OperationContext, batch: string, params
   }
   rows.sort((a, b) => a.index - b.index);
   const done = await waitForWrites(ctx.engine, rows.map(entry => entry.row), ctx.config, IMPORT_WAIT_MS * rows.length);
-  rows.forEach((entry, position) => {
+  await Promise.all(rows.map(async (entry, position) => {
     try {
-      const response = pendingAwareResponse(ctx, done[position]!);
+      // #7106: a new segmented page over 4 MiB replies at commit with `searchable: 'pending'`, read live here.
+      const response = await withLiveSearchable(ctx, pendingAwareResponse(ctx, done[position]!));
       if (entry.admitted) emitFenceNotice(ctx, response, done[position]!.slug);
       settled[entry.index] = { status: 'fulfilled', value: { ...response, ...(entry.typeWarning ? { type_warning: entry.typeWarning } : {}),
         ...(entry.slugAdvisory ? { slug_advisory: entry.slugAdvisory } : {}) } };
     } catch (reason) { settled[entry.index] = { status: 'rejected', reason }; }
-  });
+  }));
   return settled;
 }
 

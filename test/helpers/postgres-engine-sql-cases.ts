@@ -54,7 +54,9 @@ export const DOMAIN_OF: Record<string, string> = {
   'rlsScopeBindingEnabled': OOS.helper,
   'withScopedReadTransaction': OOS.helper,
   'jitOffRead': OOS.helper,
+  'readTransaction': OOS.helper,
   'connect': OOS.lifecycle,
+  'connectedDatabaseUrl': OOS.lifecycle,
   'disconnect': OOS.lifecycle,
   'disconnectInternal': OOS.helper,
   'initSchema': OOS.lifecycle,
@@ -69,6 +71,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'runUnsafe': OOS.helper,
   'executeRaw': OOS.lifecycle,
   'executeRawDirect': OOS.lifecycle,
+  'keywordBoundedRead': OOS.lifecycle,
   'runMigration': OOS.lifecycle,
   'getBulkRetryOpts': OOS.helper,
   'batchRetry': OOS.helper,
@@ -86,6 +89,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'putPage': 'pages', 'deletePage': 'pages', 'deletePages': 'pages', 'resolveSlugsByPaths': 'pages',
   'softDeletePage': 'pages', 'softDeletePages': 'pages', 'restorePage': 'pages', 'purgeDeletedPages': 'pages',
   'refreshPageBody': 'pages', 'updatePageContextualRetrievalState': 'pages', 'listPages': 'pages',
+  'findPages': 'pages', 'countPagesBy': 'pages',
   'getAllSlugs': 'pages', 'listAllPageRefs': 'pages', 'listPrefixSampledPages': 'pages', 'listCorpusSample': 'pages',
   'resolveSlugs': 'pages', 'findByTitleFuzzy': 'pages', 'getPageTimestamps': 'pages',
   'createVersion': 'pages', 'getVersions': 'pages', 'revertToVersion': 'pages', 'updateSlug': 'pages',
@@ -115,6 +119,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'countChunklessPagesWithContent': 'chunks', 'listChunklessPagesWithContent': 'chunks', 'deleteChunks': 'chunks',
   'readEmbeddingStateCounts': 'chunks', 'listEmbeddingStateRows': 'chunks',
   'allocateBodyOccurrenceIds': OOS.pageBody, 'stageSegmentTexts': OOS.pageBody, 'readSegmentTexts': OOS.pageBody, 'stageManifestRows': OOS.pageBody, 'readManifest': OOS.pageBody, 'stageSegmentChunks': OOS.pageBody, 'createSegmentedPageShell': OOS.pageBody, 'flipBodyGeneration': OOS.pageBody, 'openBodyStaging': OOS.pageBody, 'setBodyStagingState': OOS.pageBody, 'sweepSegments': OOS.pageBody,
+  'readSegmentDerivations': OOS.pageBody, 'upsertSegmentDerivations': OOS.pageBody, 'retireSegmentDerivations': OOS.pageBody,
   'getEmbeddingsByChunkIds': 'chunks', 'getChunksWithEmbeddings': 'chunks',
   // facts (incl. the ontology rows of the facts table)
   'insertFact': 'facts', 'expireFact': 'facts', 'insertFacts': 'facts', 'deleteFactsForPage': 'facts',
@@ -179,6 +184,8 @@ const DEFAULT_RULES: Rule[] = [
   [/AS snapshot_withdrawals/, [{ ...PAGE_ROW, source_incarnation: INCARNATION, snapshot_tags: [], snapshot_withdrawals: [], fingerprint_body: '', fingerprint_timeline: '' }]],
   [/current_setting\('app\.scopes', true\) AS scopes/, [{ scopes: '*' }]],
   [/^SHOW enable_seqscan$/, [{ enable_seqscan: 'on' }]],
+  // The chunk-read manifest probe (safe-chunks.ts chunkManifestReads) as the owning role answers it.
+  [/chunk-visibility-ok: whether any chunk row of a segmented body exists/, [{ readable: true, segmented: false }]],
   [/^SHOW statement_timeout$/, [{ statement_timeout: '0' }]],
 ];
 
@@ -331,6 +338,14 @@ export const SQL_CASES: SqlCase[] = [
     ['effective_before', (e) => e.listPages({ effective_before: '2026-01-01' })],
     ['sort', (e) => e.listPages({ sort: 'slug' })],
   ]),
+  ...variants('findPages', [
+    ['name', (e) => e.findPages({ pattern: { kind: 'name', like: '%acme%', lead: '' }, limit: 50, excludeSlugPrefixes: [] })],
+    ['glob+types+sourceIds+remote', (e) => e.findPages({ pattern: { kind: 'glob', like: 'people/%acme%', lead: 'people/' }, types: ['person'], limit: 10, sourceIds: SRCS, untrusted: { excludePrivate: true }, excludeSlugPrefixes: ['test/', '.raw/'] })],
+  ]),
+  ...variants('countPagesBy', [
+    ['totals', (e) => e.countPagesBy({})],
+    ['grouped+since+remote', (e) => e.countPagesBy({ sourceId: SRC, since: '2026-01-01', untrusted: { excludePrivate: true } }, (types: string[]) => types)],
+  ]),
   ...variants('getAllSlugs', [
     ['default', (e) => e.getAllSlugs()],
     ['sourceId', (e) => e.getAllSlugs({ sourceId: SRC })],
@@ -373,8 +388,8 @@ export const SQL_CASES: SqlCase[] = [
     ['sourceId', (e) => e.revertToVersion(SLUG, 3, { sourceId: SRC })],
   ]),
   ...variants('updateSlug', [
-    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]]]],
-    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2')],
+    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]], [/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
+    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2'), [[/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
   ]),
   ...variants('resolveSlugWithAlias', [['default', (e) => e.resolveSlugWithAlias('alice', SRC)]]),
   ...variants('resolveSlugWithAliasDetailed', [

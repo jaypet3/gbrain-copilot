@@ -3,7 +3,7 @@
  * primitives every Google sweep (contacts, calendar, Gmail) shares. Peeled
  * from google-source.ts so the sweeps can live in their own modules.
  */
-import { closeSync, existsSync, fchmodSync, lstatSync, openSync, renameSync, rmSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fchmodSync, lstatSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
@@ -13,6 +13,17 @@ import type { ManagedConnectorSync } from '../persistence/connector-sync.ts';
 import { connectorRender } from '../connectors/connector-text.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { mkdirPrivate } from '../atomic-write.ts';
+import { replaceableFile } from '../facts/file-body-guard.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, replaceOrInsertFactsFence } from '../facts-fence.ts';
+import { carryStoredFences, hasFence } from '../connectors/fence-carry.ts';
+import type { Page } from '../types.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
+import { OperationError } from '../ops/contract.ts';
+import { slugifyPath } from '../sync.ts';
+import { isPrivatePage } from '../search/private-visibility.ts';
+import { withPrivateVisibility } from './google-render.ts';
+import { isWriteThroughDisabled } from '../write-through.ts';
+import { isSourceDbOnlySlug } from '../persistence/source-storage.ts';
 import type { GoogleSourceConfig, GoogleSourceState } from './types.ts';
 import type { LoopsExclusionPolicy } from './loops-exclusion.ts';
 
@@ -111,6 +122,17 @@ function writePrivateTemp(tmpPath: string, markdown: string): void {
   }
 }
 
+
+/** GBRA-133 (#7292): the checkout file with the live page's `## Facts` fence put back, for `replaceableFile`; null when it has a fence of its own. */
+function withStoredFactsFence(existing: Page): (fileBytes: string) => string | null {
+  assertInlineBody(existing, 'Google connector file comparison');
+  const body = existing.compiled_truth ?? '';
+  const start = body.indexOf(FACTS_FENCE_BEGIN);
+  const stop = start === -1 ? -1 : body.indexOf(FACTS_FENCE_END, start + FACTS_FENCE_BEGIN.length);
+  const block = stop === -1 ? null : body.slice(start, stop + FACTS_FENCE_END.length);
+  return fileBytes => block === null || hasFence(fileBytes) ? null : replaceOrInsertFactsFence(fileBytes, block);
+}
+
 export async function importRendered(
   deps: GoogleSyncDeps,
   relPath: string,
@@ -121,6 +143,10 @@ export async function importRendered(
   identity: Record<string, string | readonly string[]> = {},
 ): Promise<string> {
   markdown = connectorRender(markdown, { path: relPath, account: deps.cfg.account, ...identity });
+  const slug = slugifyPath(relPath);
+  const [labels] = await deps.engine.executeRaw<{ type: string; frontmatter: unknown }>(
+    'SELECT type, frontmatter FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [deps.sourceId, slug]);
+  if (labels && isPrivatePage(labels)) markdown = withPrivateVisibility(markdown);
   if (deps.managed) {
     const result = await deps.managed.importMarkdown(relPath, markdown);
     if (result.status === 'imported') {
@@ -135,23 +161,41 @@ export async function importRendered(
   }
   const filePath = join(deps.cfg.dir, relPath);
   assertContained(deps.cfg.dir, filePath);
-  mkdirPrivate(dirname(filePath), deps.cfg.dir);
-  const before = existsSync(filePath);
+  const existing = await deps.engine.getPage(slug, { sourceId: deps.sourceId });
+  if (existing) assertInlineBody(existing, 'Google connector materialization');
+  markdown = await carryStoredFences(deps.sourceId, slug, relPath, existing, markdown, 'Google connector fence carry');
+  const databaseOnly = await isWriteThroughDisabled(deps.engine) || isSourceDbOnlySlug(deps.cfg.dir, slug, 'refuse');
+  const guard = databaseOnly ? null : await replaceableFile(deps.engine, deps.sourceId, slug, filePath, existing ? withStoredFactsFence(existing) : undefined);
+  const drift = () => new OperationError('file_database_drift',
+    `${slug}: the checkout file has an edit not retained in the database, or changed during import. The file was not replaced. If the file is newer, run gbrain sync --source ${deps.sourceId}; if the database is newer, re-save its page with write-through on; if both changed, ask the user which version to keep before retrying.`,
+    'Import the newer file with gbrain sync, or ask the user which version to keep; the item is held until then.');
+  if (guard && !guard.ok) throw drift();
+  const before = databaseOnly ? !!existing : existsSync(filePath);
   // Temp-write → import → rename: a failed import never destroys the
   // previously-good page (github-source pattern).
   const tmpPath = `${filePath}.tmp`;
-  writePrivateTemp(tmpPath, markdown);
+  if (!databaseOnly) {
+    mkdirPrivate(dirname(filePath), deps.cfg.dir);
+    writePrivateTemp(tmpPath, markdown);
+  }
   try {
-    const { importFile } = await import('../import-file.ts');
-    const result = await importFile(deps.engine, tmpPath, relPath, {
+    const { importFile, importFromContent } = await import('../import-file.ts');
+    const opts = {
       noEmbed: true, // embeds handled by the size gate below, like sync
       sourceId: deps.sourceId,
       ...(activePack ? { activePack } : {}),
-    });
+    };
+    const result = databaseOnly
+      ? await importFromContent(deps.engine, slug, markdown, { ...opts, sourcePath: relPath, preserveGateMarkers: true, holdNoncanonicalPrivate: true })
+      : await importFile(deps.engine, tmpPath, relPath, opts);
     if (result.status === 'error' || result.error) {
       throw new Error(result.error ?? `Import failed for ${relPath}`);
     }
-    renameSync(tmpPath, filePath);
+    if (guard?.ok) {
+      const current = existsSync(filePath) ? readFileSync(filePath, 'utf8') : null;
+      if (current !== guard.expectedFileBytes) throw drift();
+      renameSync(tmpPath, filePath);
+    }
     if (result.status === 'imported') {
       summary.pagesAffected.push(result.slug);
       summary.chunksCreated += result.chunks;
@@ -163,7 +207,7 @@ export async function importRendered(
     }
     return result.slug;
   } finally {
-    rmSync(tmpPath, { force: true });
+    if (!databaseOnly) rmSync(tmpPath, { force: true });
   }
 }
 

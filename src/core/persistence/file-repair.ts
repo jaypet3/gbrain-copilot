@@ -41,7 +41,7 @@
  * the source root and walked component by component with `lstat`, so a
  * symlinked directory or file is never written through.
  */
-import { lstatSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
@@ -64,7 +64,7 @@ import { parseFenceRepairReceipt, type FenceRepairReceipt } from '../fence-repai
 import { parseContentRepairReceipt, type ContentRepairReceipt } from '../content-repair/receipt.ts';
 import { prepareCanonicalProjections } from './canonical-projections.ts';
 import { digest, sha256 } from './digest.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { checkOwner, ownerUnavailableError } from './owner-refusal.ts';
 import { loadRepairBusySet, repairBusy, repairBusyError } from './repair-busy.ts';
@@ -74,8 +74,11 @@ import { screenSyncImport } from './sync-prepare.ts';
 import type { SyncRename } from './sync-discovery.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
 import type { PreparedMutation } from './coordinator.ts';
-import { contentRepairCommit, fenceRepairCommit } from './effect-model.ts';
+import { contentRepairCommit, fenceRepairCommit, localEditAdoptionCommit } from './effect-model.ts';
+import { ADOPTED_CHANGE_REASON, adoptedHeadHolds, commitAdoptedLocalEdit } from './local-edit-adoption.ts';
+import { recordSlugLineAlias } from '../page-state/rename-alias.ts';
 import type { WriteRequest } from './model.ts';
+import { bindOrigin } from './origin-guard.ts';
 
 export interface ManagedFileRepairIntent extends Record<string, unknown> {
   kind: 'managed_file_repair';
@@ -101,6 +104,8 @@ export interface ManagedFileRepairIntent extends Record<string, unknown> {
   contentRepair?: ContentRepairReceipt;
   /** #6696 C8: the hold observation the repair read; the publication clears the path's hold only while it is that observation (a newer hold stays). */
   holdObservedAt?: string;
+  /** GST-1601: an adopted one-sided local edit (local-edit-adoption.ts): the worktree blob and the revision it replaces. */
+  adoptLocalEdit?: { blob: string; replaced_revision: string; head: string | null };
 }
 
 /** The repair command a refusal names (D6 router): a fence repair's, the content repair's, or the frontmatter repair's. */
@@ -111,6 +116,20 @@ const ownerStatusFix = (sourceId: string): Action => readFix(`Shows source ${sou
   { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] });
 const previewFix = (sourceId: string, kind: FileRepairKind): Action => ({ argv: ['gbrain', 'repair', kind, '--source', sourceId], consent: [], actor: 'agent',
   requires_exclusive: false, why: `Previews the ${WORK[kind]} repair of source ${sourceId} again from the files as they are now; nothing is written.` });
+
+/**
+ * #6865: a stray slug-line removal whose receipt records the declared alias (the sync-time `absent_page` heal) publishes
+ * only while that slug still names no page, no alias of another page and no file at its path: one written since the heal
+ * read the source refuses the write, and the next run judges the file again.
+ */
+async function assertDeclaredSlugAbsent(tx: BrainEngine, sourceId: string, root: string, p: { path: string; sourcePath: string }, alias: string, slug: string, kind: FileRepairKind) {
+  const named = await tx.readPageSnapshot(alias, { sourceId, resolveAlias: true });
+  if (named && named.page.slug !== slug) throw changedSincePreview(sourceId, p.path, `its slug: line now names page ${named.page.slug}`, kind);
+  const prefix = p.sourcePath.endsWith(p.path) ? p.sourcePath.slice(0, p.sourcePath.length - p.path.length) : '';
+  const rel = prefix && alias.startsWith(prefix) ? alias.slice(prefix.length) : alias;
+  const file = ['.md', '.mdx'].map(ext => rel + ext).find(candidate => candidate !== p.path && existsSync(join(root, candidate)));
+  if (file) throw changedSincePreview(sourceId, p.path, `its slug: line now names the file ${file}`, kind);
+}
 
 function changedSincePreview(sourceId: string, path: string, why: string, kind: FileRepairKind) {
   return opError('changed_since_preview', `${path} changed since its repair was previewed: ${why}.`,
@@ -200,8 +219,8 @@ export interface RepairPublicationInput {
 
 export type RepairPublication =
   | { status: 'refused'; refusal: ContentRefusal }
-  /** Importing these bytes would store something other than the file says (retained tags, a withdrawal, sanitization). */
-  | { status: 'overlay' }
+  /** Importing these bytes would store something other than the file says (retained tags, a withdrawal, sanitization); `noop`: the page already holds that result. */
+  | { status: 'overlay'; noop: boolean }
   | { status: 'ready'; ready: PreparedContentImport; digest: string; fields: ReturnType<typeof canonicalRepairFields>; renamedType?: string };
 
 /**
@@ -232,7 +251,7 @@ export async function prepareRepairPublication(engine: BrainEngine, input: Repai
   const renamedType = renamed && parsedInput.typeExplicit !== true ? parsedInput.type : undefined;
   const tags = [...new Set([...(input.base?.tags ?? []), ...prepared.parsedPage.tags])].sort();
   const fields = canonicalRepairFields({ ...prepared.parsedPage, type: renamedType ?? prepared.parsedPage.type }, tags);
-  if (digest(canonicalRepairFields(parsed, parsed.tags)) !== digest(fields)) return { status: 'overlay' };
+  if (digest(canonicalRepairFields(parsed, parsed.tags)) !== digest(fields)) return { status: 'overlay', noop: prepared.noop };
   return { status: 'ready', ready: prepared, digest: digest(fields), fields, ...(renamedType ? { renamedType } : {}) };
 }
 
@@ -256,7 +275,7 @@ function assertTrustedRepairCaller(ctx: Pick<OperationContext, 'remote'>): void 
 export async function managedRepairRoot(engine: BrainEngine, sourceId: string, kind: FileRepairKind = 'frontmatter', opts: { remote?: boolean } = {}): Promise<{ root: string; ownerEpoch: string; incarnation: string }> {
   const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [sourceId]);
   const binding = await getWorktreeBinding(engine, sourceId);
-  const hostId = localHostId();
+  const hostId = hostIdFor(engine);
   const owner = checkOwner(binding, source?.incarnation ?? '', hostId);
   if (owner.reason) throw ownerUnavailableError({ sourceId, reason: owner.reason, binding, incarnation: source?.incarnation ?? '', hostId, remote: opts.remote !== false, work: `the ${WORK[kind]} repair` });
   return { root: join(owner.binding.local_path, owner.binding.relative_path), ownerEpoch: String(owner.binding.owner_epoch), incarnation: owner.binding.source_incarnation };
@@ -311,13 +330,20 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   }
   const fenceRepair = checkedFenceRepair(p, row.source_id);
   const contentRepair = checkedContentRepair(p, row.source_id);
+  const adopted = p.adoptLocalEdit;
+  if (adopted !== undefined && (typeof adopted?.blob !== 'string' || typeof adopted.replaced_revision !== 'string' || (typeof adopted.head !== 'string' && adopted.head !== null) || p.expected_revision !== adopted.replaced_revision)) {
+    throw opError('invalid_params', 'The local edit adoption intent is incomplete.', `Adoption request ${row.request_id} in source ${row.source_id} names no worktree blob or replaced revision, so it published nothing.`);
+  }
   const binding = await getWorktreeBinding(engine, row.source_id);
   if (!row.worktree_id || !binding?.local_path || String(binding.owner_epoch) !== p.ownerEpoch) throw opError('owner_unavailable', 'A managed file repair requires its accepted canonical owner.',
     `Source ${row.source_id}'s canonical owner changed or went away after repair request ${row.request_id} was accepted, so it published nothing. Check the owner, then preview the repair again on the host that owns the source.`,
     { fix: ownerStatusFix(row.source_id) });
   const root = join(binding.local_path, binding.relative_path);
+  const adoptNote = adopted ? localEditAdoptionCommit(p.path, adopted.blob, adopted.replaced_revision) : undefined;
   const bytes = Buffer.from(p.content, 'utf8');
   const fileChanges = sha256(bytes) !== p.beforeHash;
+  if (adopted && fileChanges) throw opError('invalid_params', 'A local edit adoption may not rewrite the file it adopts.',
+    `Adoption request ${row.request_id} in source ${row.source_id} would change ${p.path} instead of recording it as it is, so it published nothing.`);
   const checkFile = () => {
     const target = confinedRepairTarget(root, p.path, row.source_id, kind);
     if (fileSha256(target) !== p.beforeHash) throw changedSincePreview(row.source_id, p.path, 'the file bytes differ from the previewed hash', kind);
@@ -353,16 +379,23 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   const importContent = p.content.replace(/^\uFEFF/, '');
   const overrideTier = (await ownerSourceGateInput(engine, row.source_id, parseMarkdown(importContent, `${row.slug}.md`, { activePack: screenConfig.activePack }).frontmatter)).tier;
   const importOptions = { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, overrideTier, activePack: screenConfig.activePack, filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true };
+  // afterCommit follows the import that published (a page stored in segments chunks what its publication left unsealed).
+  let published = ready;
   return { observedRevision: snapshot?.revision ?? null, noop: ready.noop && !fileChanges && !moved, contentUnchanged: ready.noop && !fileChanges && !moved,
     trust: await ownerImportTrust(engine, row, ready.parsedPage.frontmatter, p.sourcePath), deferEmbedding: p.noEmbed, ...(moved ? { additionalPageKeys: [{ sourceId: row.source_id, slug: moved.slug }] } : {}),
-    ...(fileChanges ? { file: { root, path: target, content: bytes, expectedBeforeHash: p.beforeHash,
-      ...(fenceRepair ? { commit: fenceRepairCommit(p.path, fenceRepair.classes, fenceRepair.tier) } : contentRepair ? { commit: contentRepairCommit(p.path, contentRepair) } : {}) } } : {}),
+    ...(ready.afterCommit || moved ? { afterCommit: async (target: BrainEngine) => { await published.afterCommit?.(target); } } : {}),
+    ...(fileChanges || adopted ? { file: { root, path: target, content: bytes, expectedBeforeHash: p.beforeHash,
+      ...(adoptNote ? { commit: adoptNote }
+        : fenceRepair ? { commit: fenceRepairCommit(p.path, fenceRepair.classes, fenceRepair.tier) } : contentRepair ? { commit: contentRepairCommit(p.path, contentRepair) } : {}) } } : {}),
+    ...(adoptNote ? { afterEffects: (tx: BrainEngine, outcome: Record<string, unknown>) => commitAdoptedLocalEdit(tx, row.source_id, binding, target, adoptNote, outcome) } : {}),
     validate: async tx => {
       const current = await getWorktreeBinding(tx, row.source_id);
       if (!current || current.worktree_id !== row.worktree_id || String(current.owner_epoch) !== p.ownerEpoch) throw opError('owner_unavailable', 'The repair owner changed.',
         `Source ${row.source_id}'s canonical owner changed while repair request ${row.request_id} was prepared, so it published nothing. Check the owner, then preview the repair again.`,
         { fix: ownerStatusFix(row.source_id) });
       checkFile();
+      if (adopted && !await adoptedHeadHolds(binding, root, target, adopted.head)) throw changedSincePreview(row.source_id, p.path, 'git HEAD moved after its local edit was read', kind);
+      if (contentRepair?.declared_alias) await assertDeclaredSlugAbsent(tx, row.source_id, root, p, contentRepair.declared_alias, row.slug, kind);
       await assertRenameSource(tx);
       await ready.validate(tx);
     },
@@ -377,16 +410,22 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
         await movedImport.validate(tx);
         applied = movedImport;
       }
-      await applied.apply(tx);
-      await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
-      if (!applied.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
+      published = applied;
+      const [last] = adopted && snapshot ? await tx.executeRaw<{ id: number | string | null }>('SELECT max(id) AS id FROM page_versions WHERE page_id=$1', [snapshot.page.id]) : [];
+      const installed = await applied.apply(tx);
+      if (adopted && snapshot) await tx.executeRaw('UPDATE page_versions SET change_reason=$2 WHERE page_id=$1 AND id>$3', [snapshot.page.id, ADOPTED_CHANGE_REASON, Number(last?.id ?? 0)]);
+      await bindOrigin(tx, { sourceId: row.source_id, slug: row.slug, sourcePath: p.sourcePath });
+      // A body stored in segments was sealed by its import's apply when complete (sealSegmentedPage); the inline text seal reads the whole timeline.
+      if (!applied.noop) { await project(tx); if (!installed?.segmented) await sealPageTextProjection(tx, row.slug, row.source_id); }
       const holdCleared = await clearGitHold(tx, { sourceId: row.source_id, incarnation: row.source_incarnation, path: p.path, observedAt: p.holdObservedAt ?? new Date().toISOString() });
+      if (contentRepair?.declared_alias) await recordSlugLineAlias(tx, row.source_id, contentRepair.declared_alias, row.slug);
       // #6712 PR 1: the record names what is on disk now (the approved bytes), the page revision they produced and the parser, so the next discovery prescreens the file.
       const page = await tx.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
       if (page && page.page.deleted_at == null) await recordSyncImportProvenance(tx, { source_id: row.source_id, incarnation: row.source_incarnation, page_id: Number(page.page.id), origin: p.sourcePath,
         raw_sha256: sha256(importContent), gbrain_version: VERSION, revision: page.revision, parser: syncImportParserFor(p.sourcePath, screenConfig.packIdentity), ...syncDiskProvenance(bytes, null) });
       return { status: moved ? 'renamed' : applied.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
         chunks: applied.result.chunks, imported_file: true, file_repaired: fileChanges, hold_cleared: holdCleared, ...(moved ? { renamed_from: moved.slug } : {}),
-        ...(fenceRepair ? { fence_repair: fenceRepair } : {}), ...(contentRepair ? { content_repair: contentRepair } : {}) };
+        ...(fenceRepair ? { fence_repair: fenceRepair } : {}), ...(contentRepair ? { content_repair: contentRepair } : {}),
+        ...(adopted ? { adopted_local_edit: { path: p.path, blob: adopted.blob, replaced_revision: adopted.replaced_revision } } : {}) };
     } };
 }
