@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { journalLimitKey, readJournalLimits } from './limits.ts';
+import { isStagedCounterKey, journalLimitKey, readJournalLimits } from './limits.ts';
 import type { JournalLimits } from './model.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
@@ -12,8 +12,9 @@ import { listHostConsumers, type ConsumerPool, type ListedConsumer } from './con
 import type { WriteRequestState } from './types.ts';
 import { preparationBudgetMs } from './preparation-budget.ts';
 import { readWriteSwitchSnapshot } from './switches.ts';
-import { DATABASE_REFUSAL_HINT, DATABASE_TRIGGER_HINT } from './connector-errors.ts';
+import { DATABASE_REFUSAL_HINT, DATABASE_TRIGGER_HINT, ownerExceptionHint, unknownOriginHint } from './connector-errors.ts';
 import { readQueuedHeadBlockers } from './head-blocker.ts';
+import { SOURCE_CHANGED_ORIGINS } from './publication-failure.ts';
 
 export const WRITER_NEXT_ACTIONS: Record<string, string> = {
   unexpected_staging_bytes: 'Keep the worktree blocked and retain its staging files and recovery capacity. Compare the recorded staging size and hash, then reconcile unexpected bytes explicitly before retrying; never discard unverified staging files.',
@@ -119,7 +120,7 @@ function claimPool(engine: BrainEngine, claim: ClaimState, row: ListedConsumer |
 interface Counter { key: string; outstanding_count: string | number; intent_bytes: string | number;
   lifetime_ids: string | number; terminal_bytes: string | number; recovery_bytes: string | number; }
 export function capacityDiagnostics(counters: Counter[], limits: JournalLimits) {
-  return counters.flatMap(counter => {
+  return counters.filter(counter => !isStagedCounterKey(counter.key)).flatMap(counter => {
     const scope = counter.key === 'brain' ? 'brain' : counter.key.startsWith('worktree:') ? 'worktree' : 'principal';
     const resources: Array<readonly [keyof Counter, keyof JournalLimits]> = scope === 'worktree'
       ? [['recovery_bytes', 'worktreeRecoveryBytes']]
@@ -135,6 +136,13 @@ export function capacityDiagnostics(counters: Counter[], limits: JournalLimits) 
     });
   });
 }
+/** #6719: the next step a recorded origin supports; only a database origin reads as a database refusal. */
+function recentFailureNextAction(origin: unknown, requestId: string): string {
+  if (origin === 'database_guard') return DATABASE_REFUSAL_HINT;
+  if (origin === 'database_trigger' || origin === 'database') return DATABASE_TRIGGER_HINT;
+  return origin === 'owner_exception' ? ownerExceptionHint(requestId) : unknownOriginHint(requestId);
+}
+
 /** Trusted-admin counts only: neither normalized intent nor private paths leave here. */
 export async function readWriterDiagnostics(engine: BrainEngine) {
   // #6482: writer status is the probe the mode refusal names, so a malformed singleton is reported here, never refused.
@@ -144,7 +152,7 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
     COUNT(r.id) FILTER (WHERE r.state='queued')::integer AS queued,
     COUNT(r.id) FILTER (WHERE r.state='running')::integer AS running,
     COUNT(r.id) FILTER (WHERE r.state='recovering')::integer AS recovering,
-    MIN(r.created_at) FILTER (WHERE r.state IN ('queued','running','recovering')) AS oldest_request_at,
+    MIN(r.created_at) FILTER (WHERE r.state IN ('queued','deferred','running','recovering')) AS oldest_request_at,
     (MAX(r.sequence) FILTER (WHERE r.state='committed'))::text AS last_completed_sequence,
     COALESCE((SELECT c.recovery_bytes FROM persistence_counters c WHERE c.key='worktree:'||w.id::text),0)::text AS recovery_bytes,
     (SELECT COUNT(*)::integer FROM persistence_effects e WHERE e.worktree_id=w.id AND e.recovery IS NOT NULL) AS recovering_effects
@@ -156,28 +164,29 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
     operation: string; intent_kind: string | null; preparation_attempts: number | null } & Omit<ClaimRow, 'state'>>(
     `SELECT request_id,worktree_id,source_id,state,blocked_reason,error_code,created_at,claim_phase,execution_token,claim_expires_at<now() AS claim_lapsed,publication_started,
       operation,intent->>'kind' AS intent_kind,preparation_attempts,id::text AS id
-    FROM persistence_requests WHERE state IN ('queued','running','recovering') OR blocked_reason IS NOT NULL ORDER BY sequence LIMIT 100`);
+    FROM persistence_requests WHERE state IN ('queued','deferred','running','recovering') OR blocked_reason IS NOT NULL ORDER BY sequence LIMIT 100`);
   const queue = await engine.executeRaw(`SELECT state,COUNT(*)::integer AS count,COALESCE(SUM(intent_bytes),0)::text AS intent_bytes,
     MIN(created_at) AS oldest_request_at,
     MAX(EXTRACT(EPOCH FROM (now()-created_at))*1000)::bigint::text AS oldest_age_ms
-    FROM persistence_requests WHERE state IN ('queued','running','recovering') GROUP BY state ORDER BY state`);
+    FROM persistence_requests WHERE state IN ('queued','deferred','running','recovering') GROUP BY state ORDER BY state`);
   const effects = await engine.executeRaw(`SELECT e.kind,e.state,COUNT(*)::integer AS count,MIN(r.created_at) AS oldest_at
     FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id
-    WHERE e.state<>'committed' GROUP BY e.kind,e.state ORDER BY e.kind,e.state`);
+    WHERE e.state<>'committed' AND NOT (e.data ? 'settled') GROUP BY e.kind,e.state ORDER BY e.kind,e.state`);
   // #5974: trusted-admin view of database refusals, including owner-only source ids and the executing build.
   const failures = await engine.executeRaw<{ request_id: string; operation: string; source_id: string; state: WriteRequestState;
     error_code: string | null; error_detail: Record<string, unknown>; completed_at: Date | string | null }>(
     `SELECT request_id,operation,source_id,state,error_code,error_detail,completed_at FROM persistence_requests
-    WHERE error_detail IS NOT NULL AND COALESCE(error_detail->>'origin','')<>'fence' ORDER BY sequence DESC LIMIT 20`);
+    WHERE error_detail IS NOT NULL AND NOT COALESCE(error_detail->>'origin','')=ANY($1::text[]) ORDER BY sequence DESC LIMIT 20`, [['fence', ...SOURCE_CHANGED_ORIGINS]]);
   const limits = await readJournalLimits(engine);
   // #6278: the budgets, ceiling, attempt limit and switch in effect, next to every running blocker's step age.
   const snapshot = await readWriteSwitchSnapshot(engine).catch(() => null);
   const preparation_policy = snapshot ? { deadlines: snapshot.switches.preparation_deadlines, sync_preparation_ms: snapshot.preparation.syncMs,
-    maintenance_preparation_ms: snapshot.preparation.maintenanceMs, preparation_ceiling_ms: snapshot.preparation.ceilingMs, max_preparation_attempts: snapshot.preparation.maxAttempts } : null;
+    maintenance_preparation_ms: snapshot.preparation.maintenanceMs, preparation_ceiling_ms: snapshot.preparation.ceilingMs, max_preparation_attempts: snapshot.preparation.maxAttempts,
+    max_transient_retries: snapshot.preparation.transientRetries } : null;
   const { persistenceConsumerStatus } = await import('./service.ts');
   // #6317 (C1): the heartbeat rows of this host, read once, so each running claim can name its owner's liveness and pool.
-  const { existingLocalHostId } = await import('./identity.ts');
-  const hostId = existingLocalHostId();
+  const { existingHostIdFor } = await import('./identity.ts');
+  const hostId = existingHostIdFor(engine);
   const consumerRows = hostId ? await listHostConsumers(engine, hostId).catch(() => []) : [];
   const tracked = (engine as { getPoolDiagnostics?: () => { tracked?: unknown } | null }).getPoolDiagnostics?.()?.tracked ?? null;
   const claimStates = blockers.map(row => claimStateOf({ state: row.state, claim_phase: row.claim_phase, execution_token: row.execution_token, claim_lapsed: row.claim_lapsed, publication_started: row.publication_started }));
@@ -190,7 +199,7 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
     : 'The resident consumer of the process that answered this status.' };
   return { ...brain, sampled_at: new Date().toISOString(), publication_concurrency: publicationConcurrency(engine),
     local_process_ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits), preparation_policy,
-    recent_failures: failures.map(row => ({ ...row, next_action: row.error_detail?.origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT })),
+    recent_failures: failures.map(row => ({ ...row, next_action: recentFailureNextAction(row.error_detail?.origin, row.request_id) })),
     backend_visibility: backends.visibility,
     blockers: blockers.map(({ id: rowId, claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started, ...row }, index) => {
       const health = writeHealth(row);

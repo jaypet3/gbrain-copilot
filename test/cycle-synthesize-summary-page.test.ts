@@ -15,9 +15,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { __testing } from '../src/core/cycle/synthesize.ts';
-import type { PageInput } from '../src/core/types.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { lintContent } from '../src/commands/lint.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
 
 type SummaryWriter = (
   engine: BrainEngine,
@@ -33,23 +34,24 @@ const writeSummaryPage = (
   __testing as unknown as { writeSummaryPage: SummaryWriter }
 ).writeSummaryPage;
 
+// GBRA-161 PR 5: the unmanaged summary write is a single-item dream_summary generation (ledger, versions, revision
+// fence), which a putPage stub cannot serve, so the rendering tests write through a real PGLite brain and read the page back.
+let renderEngine: PGLiteEngine;
+beforeAll(async () => {
+  renderEngine = new PGLiteEngine();
+  await renderEngine.connect({});
+  await renderEngine.initSchema();
+});
+afterAll(async () => {
+  await renderEngine.disconnect();
+});
+
 async function renderSummary(writtenSlugs: string[]): Promise<{ body: string; markdown: string }> {
   const brainDir = mkdtempSync(join(tmpdir(), 'gbrain-dream-summary-'));
-  let stored: PageInput | undefined;
-  const engine = {
-    putPage: async (_slug: string, page: PageInput) => {
-      stored = page;
-      return {};
-    },
-    // #4506 dual-write suppressor reads this knob; default-on path.
-    getConfig: async (_key: string) => null,
-    // The summary write runs in a maintenance transaction; the stub is its own transaction engine.
-    executeRaw: async () => [],
-    transaction: async <T>(fn: (tx: BrainEngine) => Promise<T>) => fn(engine),
-  } as unknown as BrainEngine;
+  await resetPgliteState(renderEngine);
   try {
     await writeSummaryPage(
-      engine,
+      renderEngine,
       brainDir,
       'dream-cycle-summaries/2026-08-20',
       '2026-08-20',
@@ -60,6 +62,7 @@ async function renderSummary(writtenSlugs: string[]): Promise<{ body: string; ma
         { jobId: 3, status: 'failed' },
       ],
     );
+    const stored = await renderEngine.getPage('dream-cycle-summaries/2026-08-20');
     if (!stored) throw new Error('summary page was not persisted');
     return {
       body: stored.compiled_truth,
@@ -72,6 +75,15 @@ async function renderSummary(writtenSlugs: string[]): Promise<{ body: string; ma
     rmSync(brainDir, { recursive: true, force: true });
   }
 }
+
+describe('dream-cycle summary temporal frontmatter (#6773)', () => {
+  // Contributed by @lubosxyz (#6773): dream provenance keys are not temporal keys, so the summary failed missing-created.
+  test('the summary records created as its own cycle date and passes lint', async () => {
+    const { markdown } = await renderSummary(['wiki/originals/ideas/example-output']);
+    expect(parseMarkdown(markdown).frontmatter.created).toBe('2026-08-20');
+    expect(lintContent(markdown, 'dream-cycle-summaries/2026-08-20.md')).toEqual([]);
+  });
+});
 
 describe('dream-cycle summary graph bounds (#4337)', () => {
   test('more than 2,000 outputs produce one deterministic bounded sample with recoverable provenance', async () => {

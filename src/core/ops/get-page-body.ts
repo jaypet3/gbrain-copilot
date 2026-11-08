@@ -11,9 +11,11 @@
  *   body: 'none'    metadata, revision, size and chunk/embedding counts, no text:
  *                   the cheap read before edit_page / put_page.
  *   body: 'outline' metadata, size and a paged outline.
- *   body: 'window'  metadata, size and one window chosen by ONE selector:
+ *   body: 'window'  metadata, size and one window chosen by one selector:
  *                   lines {from, count}, bytes {offset, length}, around_chunk_id
- *                   (+ context_lines) or cursor; none = from the start.
+ *                   (+ context_lines) or cursor; none = from the start. With
+ *                   several, cursor, then around_chunk_id, then lines, then
+ *                   bytes applies, and `window_selector` names what was set aside.
  *
  * A partial shape NEVER carries compiled_truth, timeline or content, so no
  * caller can mistake a window for the page and write it back whole. Windows
@@ -22,9 +24,11 @@
  * markdown `content` instead (thin-client complete downloads), with its
  * sha256 for verification.
  *
- * Precedence: an explicit `body` wins; without it include_content or
- * content_only mean 'full' (content_only keeps the round-trip shape), a
- * selector means 'window', gbrain's thin client means 'full' (an older thin
+ * Precedence: a window selector means 'window' (body 'full', include_content
+ * and content_only beside it are set aside; body 'none' or 'outline' beside it
+ * is refused); otherwise an explicit `body` wins; without it include_content
+ * or content_only mean 'full' (content_only keeps the round-trip shape),
+ * gbrain's thin client means 'full' (an older thin
  * client renders compiled_truth as the whole page), a trusted local read means
  * 'full', anything else 'auto'.
  */
@@ -33,18 +37,26 @@ import type { OperationContext, ParamDef } from './contract.ts';
 import { opError, OperationError } from './contract.ts';
 import { invalidParam, readFix } from './op-fix.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { isSegmentedPage, pageBodyBytes } from '../page-body/page-shape.ts';
 import { deepResearchPageUrl, encodeDeepResearchId } from '../deep-research-id.ts';
 import { encodedFrameBytes, EGRESS_CAP_CONFIG_KEYS, egressTransport, FRAME_RESERVE_BYTES, resultByteCap } from '../egress-budget.ts';
 import { DEFAULT_INLINE_BODY_BYTES, chunkDocumentSpan, readPageDocument, spanHoldsChunk, type PageDocument } from '../page-window/document.ts';
 import {
   DEFAULT_CONTEXT_LINES, DEFAULT_OUTLINE_LIMIT, DEFAULT_WINDOW_BYTES, MAX_CONTEXT_LINES, MAX_OUTLINE_LIMIT, MAX_WINDOW_BYTES,
   decodeCursor, encodeCursor, pageOutline, sha256Hex, totalLines, windowAround, windowForBytes, windowForLines, windowFrom,
-  type WindowSlice, type WindowView,
+  type PageOutline, type WindowSlice, type WindowView,
 } from '../page-window/window.ts';
+import {
+  markdownDigest, markdownHead, readViewLines, segmentedMarkdownDocument, segmentedOutline, segmentedReadDocument, tailDigest, type SegmentedDocument,
+} from '../page-window/segmented.ts';
+import { confirmBodyPin, hiddenBefore, openSegmentedBody, type BodyPin } from '../page-body/read-range.ts';
+import { inlineRegions, inlineTailDigest } from '../page-body/tail-digest.ts';
+import { TIMELINE_SEPARATOR } from '../page-window/document.ts';
 import { renderTrustedText, type TrustFields } from '../eligibility/labels.ts';
-import type { QuarantinedView } from './get-page-projection.ts';
-import { chunkGenerationProbe } from '../search/safe-chunks.ts';
+import { fenceTranscriptText, neutralizeToolCalls } from '../search/transcript-quote.ts';
+import { pageTrustForRead, quotedPageMeta, type QuarantinedView } from './get-page-projection.ts';
+import { chunkGenerationProbe, chunkManifestReads } from '../search/safe-chunks.ts';
+import { GET_PAGE_SLICE_PARAMS, parseSliceRequest, readGrep, readSection, sliceCharBudget, type SliceRequest } from './get-page-slice.ts';
 
 export const BODY_MODES = ['auto', 'full', 'none', 'outline', 'window'] as const;
 export type BodyMode = typeof BODY_MODES[number];
@@ -60,15 +72,16 @@ const AUTO_WINDOW_BYTES = 16_000;
 export const LARGE_PAGES_CAPABILITY = 'large_pages_v1';
 
 export const GET_PAGE_BODY_PARAMS: Record<string, ParamDef> = {
-  body: { type: 'string', enum: [...BODY_MODES], description: 'auto: whole up to 256 KB, else outline + window. none: revision + size.', fullSurfaceOnly: true },
-  lines: { type: 'object', description: 'Window: 1-based lines.', properties: { from: { type: 'number', required: true }, count: { type: 'number', required: true } }, fullSurfaceOnly: true },
-  bytes: { type: 'object', description: 'Window: UTF-8 bytes (snapped to a line start).', properties: { offset: { type: 'number', required: true }, length: { type: 'number', required: true } }, fullSurfaceOnly: true },
-  around_chunk_id: { type: 'number', description: 'Window around a search hit chunk_id.', fullSurfaceOnly: true },
+  body: { type: 'string', enum: [...BODY_MODES], description: 'auto: whole up to 256 KB, else outline + window; a window\'s edit_target is edit_page `within`. none: revision + size + tail_sha256 (append_page expected_tail_sha256).', fullSurfaceOnly: true },
+  lines: { type: 'object', cliRange: ['from', 'count'], description: 'Window: 1-based lines.', properties: { from: { type: 'number', required: true }, count: { type: 'number', required: true } }, fullSurfaceOnly: true },
+  bytes: { type: 'object', cliRange: ['offset', 'length'], description: 'Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).', properties: { offset: { type: 'number', required: true }, length: { type: 'number', required: true } }, fullSurfaceOnly: true },
+  around_chunk_id: { type: 'number', minimum: 1, description: 'Window around a search hit chunk_id.', fullSurfaceOnly: true },
   context_lines: { type: 'number', description: 'Lines around around_chunk_id (20).', fullSurfaceOnly: true },
   cursor: { type: 'string', description: 'next_cursor: read on.', fullSurfaceOnly: true },
-  max_bytes: { type: 'number', description: 'Window bytes (40000).', fullSurfaceOnly: true },
+  max_bytes: { type: 'number', minimum: 1, description: 'Window bytes (40000).', fullSurfaceOnly: true },
   view: { type: 'string', enum: ['read', 'markdown'], description: 'markdown: page the round-trip content.', fullSurfaceOnly: true },
   outline_from: { type: 'number', description: 'Outline next_from_index.', fullSurfaceOnly: true },
+  ...GET_PAGE_SLICE_PARAMS,
 };
 
 type Selector =
@@ -77,15 +90,38 @@ type Selector =
   | { kind: 'around'; chunkId: number }
   | { kind: 'cursor'; raw: string };
 
+/** Several window selectors: the first of these applies, most specific first (GBRA-280: GPT-6.1 Sol sends them all and never followed the refusal's fix). */
+const SELECTOR_ORDER: readonly Selector['kind'][] = ['cursor', 'around', 'lines', 'bytes'];
+const PRECEDENCE_NOTE = 'get_page reads one window: cursor, then around_chunk_id, then lines, then bytes.';
+const CONTENT_SET_ASIDE_NOTE = "This window is not the page's content: put_page with it would replace the whole page with this window, so edit through edit_page with edit_target, or read with include_content alone.";
+const selectorParam = (s: Selector) => (s.kind === 'around' ? 'around_chunk_id' : s.kind);
+
+/** The response's account of a read that set window arguments aside: what applied, what was ignored, and the rule. */
+function selectorNote(applied: Selector, ignored: string[], failed: Array<[string, string]> = []): { applied: string; ignored: string[]; note: string } {
+  const list = (ks: string[]) => ks.length > 1 ? `${ks.slice(0, -1).join(', ')} and ${ks[ks.length - 1]}` : ks[0]!;
+  const rest = ignored.filter(k => !failed.some(([key]) => key === k));
+  const what = failed.length
+    ? `${failed.map(([, why]) => why).join('; ')}, so this is the ${selectorParam(applied)} window${rest.length ? `; ignored ${list(rest)}` : ''}`
+    : `Read the ${selectorParam(applied)} window; ignored ${list(rest)}`;
+  const notContent = ignored.includes('include_content') || ignored.includes('content_only') ? `${CONTENT_SET_ASIDE_NOTE} ` : '';
+  return { applied: selectorParam(applied), ignored, note: `${what}. ${notContent}${PRECEDENCE_NOTE}` };
+}
+
 export interface BodyRequest {
   mode: BodyMode;
   selector?: Selector;
+  /** The remaining selectors by precedence, tried in order when a cursor or around_chunk_id cannot read this page at its current revision. */
+  fallbacks?: Selector[];
+  /** Window arguments the read set aside: lower-precedence selectors, and body 'full', include_content or content_only beside a selector. */
+  ignored?: string[];
   view: WindowView;
   maxBytes?: number;
   contextLines: number;
   outlineFrom: number;
   /** The caller named no mode and is gbrain's thin client (full or refused, never a window). */
   legacyThin: boolean;
+  /** section or grep (#7180): one part of the read view instead of a window. */
+  slice?: SliceRequest;
 }
 
 const SELECTOR_EXAMPLE = { slug: 'notes/acme-example-log', body: 'window', lines: { from: 1, count: 200 } };
@@ -99,6 +135,8 @@ export function parseBodyRequest(ctx: Pick<OperationContext, 'remote' | 'transpo
   if (body !== undefined && (typeof body !== 'string' || !(BODY_MODES as readonly string[]).includes(body))) {
     throw invalidParam(ctx, 'get_page', 'body', `get_page: body must be one of ${BODY_MODES.join(', ')}.`, { choices: BODY_MODES, example: 'none' });
   }
+  const slice = parseSliceRequest(ctx, p);
+  if (slice) return { mode: 'window', view: 'read', contextLines: DEFAULT_CONTEXT_LINES, outlineFrom: 0, legacyThin: false, slice };
   const selectors: Selector[] = [];
   if (p.lines !== undefined) {
     const l = p.lines as Record<string, unknown> | null;
@@ -122,30 +160,29 @@ export function parseBodyRequest(ctx: Pick<OperationContext, 'remote' | 'transpo
     if (typeof p.cursor !== 'string' || !p.cursor) throw bad('cursor', 'get_page: cursor must be the next_cursor string from the previous window.', 'gpw1.…');
     selectors.push({ kind: 'cursor', raw: p.cursor });
   }
-  if (selectors.length > 1) {
-    throw bad(selectors[1].kind === 'around' ? 'around_chunk_id' : selectors[1].kind, `get_page: pass one window selector, not ${selectors.length} (got ${selectors.map(s => s.kind === 'around' ? 'around_chunk_id' : s.kind).join(' and ')}).`);
-  }
+  selectors.sort((a, b) => SELECTOR_ORDER.indexOf(a.kind) - SELECTOR_ORDER.indexOf(b.kind));
+  const view = p.view === undefined ? 'read' : p.view;
+  if (view !== 'read' && view !== 'markdown') throw invalidParam(ctx, 'get_page', 'view', "get_page: view must be 'read' or 'markdown'.", { choices: ['read', 'markdown'], example: 'markdown' });
+  const usable = view === 'markdown' && selectors.length > 1 ? selectors.filter(s => s.kind !== 'around') : selectors;
+  const ignored: string[] = selectors.filter(s => s !== usable[0]).map(selectorParam);
   const includeContent = p.include_content === true;
   const contentOnly = p.content_only === true;
   let mode: BodyMode;
-  if (typeof body === 'string') {
+  if (selectors.length && (body === undefined || body === 'full' || body === 'auto' || body === 'window')) {
+    mode = 'window';
+    if (body === 'full') ignored.push('body');
+    if (includeContent) ignored.push('include_content');
+    if (contentOnly) ignored.push('content_only');
+  } else if (typeof body === 'string') {
     mode = body as BodyMode;
     if ((includeContent || contentOnly) && mode !== 'full') {
       throw bad('body', `get_page: include_content and content_only return the whole page; they cannot be combined with body: '${mode}'.`, { slug: 'notes/acme-example-log', body: 'full', include_content: true });
     }
-    if (selectors.length && mode !== 'window' && mode !== 'auto') {
-      throw bad('body', `get_page: a window selector needs body: 'window' (got body: '${mode}').`);
-    }
-    if (mode === 'auto' && selectors.length) mode = 'window';
-  } else if (includeContent || contentOnly) {
-    if (selectors.length) throw bad('include_content', 'get_page: include_content returns the whole page; drop it to read a window.');
-    mode = 'full';
-  } else if (selectors.length) mode = 'window';
+    if (selectors.length) throw bad('body', `get_page: a window selector needs body: 'window' (got body: '${mode}').`);
+  } else if (includeContent || contentOnly) mode = 'full';
   else if (ctx.thinClient === true || ctx.remote === false) mode = 'full';
   else mode = 'auto';
-  const view = p.view === undefined ? 'read' : p.view;
-  if (view !== 'read' && view !== 'markdown') throw invalidParam(ctx, 'get_page', 'view', "get_page: view must be 'read' or 'markdown'.", { choices: ['read', 'markdown'], example: 'markdown' });
-  if (view === 'markdown' && (mode !== 'window' || selectors[0]?.kind === 'around')) {
+  if (view === 'markdown' && (mode !== 'window' || usable[0]?.kind === 'around')) {
     throw bad('view', "get_page: view: 'markdown' pages the round-trip markdown with body: 'window' and a lines, bytes or cursor selector.", { slug: 'notes/acme-example-log', body: 'window', view: 'markdown', bytes: { offset: 0, length: 1_000_000 } });
   }
   let maxBytes: number | undefined;
@@ -163,7 +200,7 @@ export function parseBodyRequest(ctx: Pick<OperationContext, 'remote' | 'transpo
     if (!int(p.outline_from) || p.outline_from < 0) throw bad('outline_from', 'get_page: outline_from must be a non-negative integer (the previous next_from_index).', 100);
     outlineFrom = p.outline_from;
   }
-  return { mode, ...(selectors[0] ? { selector: selectors[0] } : {}), view, ...(maxBytes !== undefined ? { maxBytes } : {}), contextLines, outlineFrom,
+  return { mode, ...(usable[0] ? { selector: usable[0] } : {}), ...(usable.length > 1 ? { fallbacks: usable.slice(1) } : {}), ...(ignored.length ? { ignored } : {}), view, ...(maxBytes !== undefined ? { maxBytes } : {}), contextLines, outlineFrom,
     legacyThin: typeof body !== 'string' && ctx.thinClient === true && !includeContent && !contentOnly && !selectors.length };
 }
 
@@ -208,6 +245,47 @@ export async function assertFullReadFits(ctx: OperationContext, page: Pick<Page,
       fix: sizeFix(page.slug, page.source_id, "Returns the page's size, revision and outline; each entry names the lines to read with body: 'window'.") });
 }
 
+/**
+ * A segmented page is never built whole (spec 7.2). Every caller gets page_body_segmented with a fix that reads it in
+ * pieces (body: 'auto' gives the outline and the first window), and a trusted local `gbrain get` answers it by
+ * streaming the page. The thin client's whole-page read keeps page_too_large_for_inline: that is its paging signal
+ * (it pages view: 'markdown' to the end), refused before any window is read. A remote caller is told the size of the
+ * read projection (as an inline page reports its privacy-stripped body), never the stored body_bytes, whose difference
+ * would say how much text the projection hides.
+ */
+export async function segmentedFullReadError(ctx: OperationContext, page: Page, req: BodyRequest, pin: BodyPin): Promise<OperationError> {
+  let total = pageBodyBytes(page);
+  if (ctx.remote !== false) {
+    const body = await openSegmentedBody(ctx.engine, { pageId: page.id, pin });
+    total = (await segmentedReadDocument(ctx.engine, body)).total;
+    await confirmBodyPin(ctx.engine, body);
+  }
+  const windows = "Read it in pieces: get_page body: 'auto' returns the outline and the first window, then body: 'window' with lines, bytes, around_chunk_id or next_cursor reads on.";
+  const fix = segmentedReadFix(page.slug, page.source_id);
+  if (ctx.remote === false) {
+    return opError('page_body_segmented', `get_page: page ${page.slug} (source ${page.source_id}) stores its ${total}-byte body in segments; it is not returned as one string.`,
+      `${windows} gbrain get (no --body) prints it whole, streamed.`, { fix });
+  }
+  const transport = egressTransport(ctx)!;
+  const detail = JSON.stringify({ total_bytes: total, body_storage: 'segmented', transport });
+  if (ctx.thinClient !== true) {
+    return opError('page_body_segmented', `get_page: page ${page.slug} (source ${page.source_id}) stores its ${total}-byte body in segments; it is never returned as one string.`,
+      `${windows} Edit with edit_page (revision from body: 'none').`, { detail, fix });
+  }
+  return opError('page_too_large_for_inline', `Page ${page.slug} is stored in segments (${total} bytes) and is never returned whole on this connection.`,
+    req.legacyThin
+      ? 'This gbrain CLI is older than the host and reads pages whole. Upgrade it (gbrain upgrade) to page through large pages, or read windows over MCP with get_page body: \'window\'.'
+      : `${windows} Edit with edit_page (revision from body: 'none').`,
+    { legacy_error: 'invalid_params', detail,
+      fix: sizeFix(page.slug, page.source_id, "Returns the page's size, revision and outline; each entry names the lines to read with body: 'window'.") });
+}
+
+/** The read a segmented page's whole-body refusal names: body 'auto' (outline plus the first window, with a cursor to read on). */
+export function segmentedReadFix(slug: string, sourceId: string) {
+  return readFix("Returns the page's outline and its first window, with next_cursor to read on; body: 'window' reads any lines or bytes.",
+    { argv: ['gbrain', 'get', '--source', sourceId, '--body', 'auto', '--', slug], mcp: { tool: 'get_page', arguments: { slug, source_id: sourceId, body: 'auto' } } });
+}
+
 /** The largest window this caller may receive: the request, the per-window ceiling and the egress cap minus metadata room. */
 async function windowBudget(ctx: OperationContext, requested: number | undefined, fallback: number): Promise<number> {
   const cap = await resultByteCap({ remote: ctx.remote, transport: ctx.transport, engine: ctx.engine, config: ctx.config });
@@ -226,20 +304,37 @@ export interface PartialReadInput {
   quarantined: QuarantinedView | null;
   trust?: TrustFields;
   extras: Record<string, unknown>;
+  /** A segmented page's reads are pinned to `revision`, this body generation (from the same snapshot) and `admit` (openSegmentedBody). */
+  pin?: Omit<BodyPin, 'revision'>;
+  /** #8042: the page's text is third-party and the reader untrusted: every returned window is fenced as quoted source material (`quoted: "transcript"`). */
+  quote?: boolean;
+  /** GST-687 (get-page-projection.ts neutralizesBody): view 'read' windows carry tool-call blocks summarized; view 'markdown' stays byte-exact. */
+  neutralize?: boolean;
 }
 
-function envelopeText(text: string, quarantined: QuarantinedView | null, trust?: TrustFields): string {
-  return quarantined?.body_enveloped && text ? renderTrustedText(text, { trust_tier: 'external_untrusted', origin: trust?.origin ?? 'quarantined' }) : text;
+/** The pin of a segmented read after get_page's or fetch's authorization: the snapshot's generation, with the trust floor re-checked when the read confirms. */
+export function authorizedReadPin(ctx: OperationContext, page: Page, generation: number | undefined, minTrust: unknown, refuse: () => Error): Omit<BodyPin, 'revision'> {
+  return { generation, admit: async () => { if (!await pageTrustForRead(ctx, page, minTrust)) throw refuse(); } };
 }
 
-/** Resolve a chunk-centered window: stored span first, then an unambiguous text match, else the chunk itself. */
-async function aroundChunk(ctx: OperationContext, page: Page, doc: PageDocument, chunkId: number, contextLines: number, maxBytes: number, revision: string):
+/** Window text as the reader gets it: fenced as a quote of `quote` (#8042), then data-enveloped when quarantined. */
+function envelopeText(text: string, quarantined: QuarantinedView | null, trust: TrustFields | undefined, quote: string | null): string {
+  const quoted = quote && text ? fenceTranscriptText(text, quote) : text;
+  return quarantined?.body_enveloped && quoted ? renderTrustedText(quoted, { trust_tier: 'external_untrusted', origin: trust?.origin ?? 'quarantined' }) : quoted;
+}
+
+/**
+ * Resolve a chunk-centered window: stored span first, then an unambiguous text match, else the chunk itself. A
+ * segmented page has no text match: its chunk's occurrence must be live (else revision_changed) and its
+ * segment-relative span must still hold the chunk.
+ */
+async function aroundChunk(ctx: OperationContext, page: Page, doc: WindowDocument, chunkId: number, contextLines: number, maxBytes: number, revision: string):
   Promise<{ window: WindowSlice | null; chunkText: string; anchor: 'stored_span' | 'located' | 'chunk_only'; span?: { byte_start: number; byte_end: number } }> {
-  const rows = await ctx.engine.executeRaw<{ chunk_text: string; chunk_source: string; projected_byte_start: unknown; projected_byte_end: unknown }>(
-    `SELECT chunk_text, chunk_source, projected_byte_start, projected_byte_end FROM content_chunks
-      WHERE id = $1 AND page_id = $2 AND COALESCE(modality, 'text') = 'text' AND ${chunkGenerationProbe('content_chunks')}`, [chunkId, page.id]);
+  const rows = await ctx.engine.executeRaw<{ chunk_text: string; chunk_source: string; occurrence_id: unknown; projected_byte_start: unknown; projected_byte_end: unknown }>(
+    `SELECT chunk_text, chunk_source, occurrence_id, projected_byte_start, projected_byte_end FROM content_chunks
+      WHERE id = $1 AND page_id = $2 AND COALESCE(modality, 'text') = 'text' AND ${chunkGenerationProbe('content_chunks', await chunkManifestReads(ctx.engine))}`, [chunkId, page.id]);
   const row = rows[0];
-  if (!row) {
+  if (!row || (doc.segments && !doc.segments.body.rows.some(r => r.occurrenceId === Number(row.occurrence_id)))) {
     throw opError('revision_changed', `Chunk ${chunkId} is not part of page ${page.slug} at its current revision.`,
       "The page was re-chunked or edited since that search. Search again for a current chunk_id, or read the page's outline.",
       { legacy_error: 'invalid_params', detail: JSON.stringify({ revision, chunk_id: chunkId }),
@@ -248,20 +343,124 @@ async function aroundChunk(ctx: OperationContext, page: Page, doc: PageDocument,
   const chunk = { chunk_source: row.chunk_source,
     projected_byte_start: row.projected_byte_start == null ? null : Number(row.projected_byte_start),
     projected_byte_end: row.projected_byte_end == null ? null : Number(row.projected_byte_end) };
-  const stored = chunkDocumentSpan(doc, chunk);
-  if (stored && spanHoldsChunk(doc, stored, row.chunk_text)) {
-    return { window: windowAround(doc.bytes, stored, contextLines, maxBytes), chunkText: row.chunk_text, anchor: 'stored_span', span: { byte_start: stored.start, byte_end: stored.end } };
+  if (doc.segments) {
+    const found = await doc.segments.aroundChunk({ ...chunk, occurrence_id: Number(row.occurrence_id), chunk_text: row.chunk_text }, contextLines, maxBytes);
+    return found
+      ? { window: found.window, chunkText: row.chunk_text, anchor: 'stored_span', span: { byte_start: found.span.start, byte_end: found.span.end } }
+      : { window: null, chunkText: row.chunk_text, anchor: 'chunk_only' };
+  }
+  const inline = doc.inline!;
+  const stored = chunkDocumentSpan(inline, chunk);
+  if (stored && spanHoldsChunk(inline, stored, row.chunk_text)) {
+    return { window: windowAround(inline.bytes, stored, contextLines, maxBytes), chunkText: row.chunk_text, anchor: 'stored_span', span: { byte_start: stored.start, byte_end: stored.end } };
   }
   // No stored span (a chunk written before spans were recorded) or a stale one: accept a text match only when it is unique.
   const needle = Buffer.from(row.chunk_text.trim(), 'utf8');
   if (needle.length >= 16) {
-    const at = doc.bytes.indexOf(needle);
-    if (at !== -1 && doc.bytes.indexOf(needle, at + 1) === -1) {
+    const at = inline.bytes.indexOf(needle);
+    if (at !== -1 && inline.bytes.indexOf(needle, at + 1) === -1) {
       const span = { start: at, end: at + needle.length };
-      return { window: windowAround(doc.bytes, span, contextLines, maxBytes), chunkText: row.chunk_text, anchor: 'located', span: { byte_start: span.start, byte_end: span.end } };
+      return { window: windowAround(inline.bytes, span, contextLines, maxBytes), chunkText: row.chunk_text, anchor: 'located', span: { byte_start: span.start, byte_end: span.end } };
     }
   }
   return { window: null, chunkText: row.chunk_text, anchor: 'chunk_only' };
+}
+
+/** What a partial read cuts: an inline page's document bytes, or a segmented page's stored sums and segments. */
+interface WindowDocument {
+  total: number;
+  segmented: boolean;
+  outline(from: number, limit: number): Promise<PageOutline>;
+  from(offset: number, maxBytes: number): Promise<WindowSlice>;
+  lines(from: number, count: number, maxBytes: number): Promise<WindowSlice>;
+  bytes(offset: number, length: number): Promise<WindowSlice>;
+  /** The whole document in order, one segment (or the inline page) at a time: what section and grep scan. */
+  stream(): AsyncIterable<Buffer>;
+  /** around_chunk_id's text: the inline document, or the segmented read view. */
+  inline?: PageDocument;
+  segments?: SegmentedDocument;
+}
+
+function inlineDocument(doc: PageDocument): WindowDocument {
+  return {
+    total: doc.bytes.length, segmented: false, inline: doc,
+    outline: async (from, limit) => pageOutline(doc.bytes, from, limit),
+    from: async (offset, maxBytes) => windowFrom(doc.bytes, offset, maxBytes),
+    lines: async (from, count, maxBytes) => windowForLines(doc.bytes, from, count, maxBytes),
+    bytes: async (offset, length) => windowForBytes(doc.bytes, offset, length),
+    stream: async function* () { yield doc.bytes; },
+  };
+}
+
+/**
+ * A segmented page's document and size (spec 7.2): read-view totals from the stored sums (the line count cached
+ * per revision), for a trusted caller the stored body size, and for `none` the tail digest; a markdown view's size
+ * is its cached digest. A remote caller gets projected totals only, as for an inline page.
+ */
+async function segmentedWindows(ctx: OperationContext, input: PartialReadInput, req: BodyRequest, mode: BodyMode): Promise<{ doc: WindowDocument; size: Record<string, unknown> }> {
+  const { page, revision, tags } = input;
+  const body = await openSegmentedBody(ctx.engine, { pageId: page.id, pin: { ...input.pin, revision } });
+  const audience = ctx.remote === false ? 'trusted' : 'remote';
+  const stored = audience === 'trusted' ? { body_bytes: body.bodyBytes, body_lines: body.bodyLines } : {};
+  let seg: SegmentedDocument;
+  let size: Record<string, unknown>;
+  if (req.view === 'markdown') {
+    seg = await segmentedMarkdownDocument(ctx.engine, body, markdownHead(page, tags), audience);
+    size = { ...await markdownDigest(seg, revision, audience), ...stored };
+  } else {
+    seg = await segmentedReadDocument(ctx.engine, body);
+    size = { total_bytes: seg.total, total_lines: await readViewLines(seg, revision), ...(seg.timelineByte >= 0 ? { timeline_byte_start: seg.timelineByte } : {}),
+      ...stored, ...(mode === 'none' ? await tailDigest(ctx.engine, body, ctx.remote !== false) : {}) };
+  }
+  return { size, doc: {
+    total: seg.total, segmented: true, segments: seg,
+    outline: (from, limit) => segmentedOutline(seg, from, limit, Number(size.total_lines)),
+    from: (offset, maxBytes) => seg.from(offset, maxBytes),
+    lines: (from, count, maxBytes) => seg.lines(from, count, maxBytes),
+    bytes: (offset, length) => seg.bytes(offset, length),
+    stream: () => seg.stream(),
+  } };
+}
+
+/**
+ * Wave B (spec 6.3): the stored-body range under a read-view window, for edit_page's `within`. A row (or an inline
+ * region) whose read projection is its stored bytes maps byte for byte; any other widens to its stored bounds, so the
+ * range always covers the window. A remote caller gets it only while nothing hidden precedes the window's end: stored
+ * offsets would otherwise measure the hidden text.
+ */
+async function editTarget(ctx: OperationContext, page: Page, doc: WindowDocument, win: WindowSlice, revision: string):
+  Promise<{ revision: string; byte_start: number; byte_end: number } | undefined> {
+  const remote = ctx.remote !== false;
+  if (doc.segments) {
+    const seg = doc.segments;
+    const { rows, truthBytes, bodyBytes } = seg.body;
+    /** Stored offset of read-view byte `p`: a window start (the unit holding p) or end (the unit holding p - 1). */
+    const map = (p: number, side: 'start' | 'end') => {
+      if (p >= seg.total) return bodyBytes;
+      const u = seg.units[seg.unitAt(side === 'end' ? Math.max(0, p - 1) : p)];
+      if (!u) return 0;
+      if (u.row < 0) return truthBytes;
+      const row = rows[u.row]!;
+      if (u.bytes === row.byteLen && !row.hasFacts) return row.byteStart + Math.min(row.byteLen, p - u.start);
+      return side === 'start' ? row.byteStart : row.byteStart + row.byteLen;
+    };
+    if (remote && await hiddenBefore(ctx.engine, seg.body, win.byte_end, 'projected')) return undefined;
+    const start = map(win.byte_start, 'start');
+    return { revision, byte_start: start, byte_end: Math.max(start, map(win.byte_end, 'end')) };
+  }
+  const { truth, timeline } = await inlineRegions(ctx.engine, page.id);
+  const truthBytes = Buffer.byteLength(truth, 'utf8'), bodyBytes = truthBytes + Buffer.byteLength(timeline, 'utf8');
+  const raw = timeline.trim() ? truth + TIMELINE_SEPARATOR + timeline : truth;
+  const bytes = doc.inline!.bytes;
+  if (bytes.equals(Buffer.from(raw, 'utf8'))) {
+    const at = (p: number) => p <= truthBytes ? p : p < truthBytes + Buffer.byteLength(TIMELINE_SEPARATOR) ? truthBytes : p - Buffer.byteLength(TIMELINE_SEPARATOR);
+    return { revision, byte_start: at(win.byte_start), byte_end: at(win.byte_end) };
+  }
+  if (remote) return undefined;
+  const timelineAt = doc.inline!.timelineByte;
+  const inTruth = timelineAt < 0 || win.byte_end <= timelineAt - Buffer.byteLength(TIMELINE_SEPARATOR);
+  const inTimeline = timelineAt >= 0 && win.byte_start >= timelineAt;
+  return { revision, byte_start: inTimeline ? truthBytes : 0, byte_end: inTruth ? truthBytes : bodyBytes };
 }
 
 /** next_cursor plus `next`, the exact call that reads on (the starter surface does not advertise `cursor`; dispatch accepts it). */
@@ -270,12 +469,16 @@ function setNext(out: Record<string, unknown>, page: Page, cursor: string, markd
   out.next = { tool: 'get_page', arguments: { slug: page.slug, source_id: page.source_id, cursor, ...(markdown ? { view: 'markdown' } : {}) } };
 }
 
-/** The `body: 'none'` response: `out` plus chunk and embedding counts, no text. */
+/**
+ * The `body: 'none'` response: `out` plus chunk and embedding counts, no text. A segmented page reports no counts:
+ * counting its chunks is O(page), and its `none` stays O(1) in the page size (spec 7.2).
+ */
 async function noneResult(ctx: OperationContext, page: Page, out: Record<string, unknown>, truncated: boolean): Promise<Record<string, unknown>> {
+  const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
+  if (isSegmentedPage(page)) return { ...out, ...(fm.embed_skip ? { embed_skip: true } : {}), truncated };
   const [counts] = await ctx.engine.executeRaw<{ total: unknown; embedded: unknown }>(
     `SELECT count(*) AS total, count(*) FILTER (WHERE embedded_at IS NOT NULL) AS embedded FROM content_chunks
-      WHERE page_id = $1 AND ${chunkGenerationProbe('content_chunks')}`, [page.id]);
-  const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
+      WHERE page_id = $1 AND ${chunkGenerationProbe('content_chunks', await chunkManifestReads(ctx.engine))}`, [page.id]);
   return { ...out, chunks: { total: Number(counts?.total ?? 0), embedded: Number(counts?.embedded ?? 0) },
     ...(fm.embed_skip ? { embed_skip: true } : {}), truncated };
 }
@@ -286,91 +489,137 @@ async function noneResult(ctx: OperationContext, page: Page, out: Record<string,
  */
 export async function readPartialBody(ctx: OperationContext, input: PartialReadInput, req: BodyRequest): Promise<Record<string, unknown>> {
   const { page, revision, tags, quarantined, trust, extras } = input;
+  const neutralize = input.neutralize === true && req.view !== 'markdown';
+  const wrap = (text: string) => envelopeText(neutralize && text ? neutralizeToolCalls(text) : text, quarantined, trust, input.quote ? page.slug : null);
   const base: Record<string, unknown> = {
-    slug: page.slug, source_id: page.source_id, type: page.type, title: page.title, revision, tags,
-    frontmatter: page.frontmatter ?? {}, ...(page.deleted_at ? { deleted_at: page.deleted_at } : {}),
-    ...(trust ?? {}), ...extras,
+    slug: page.slug, source_id: page.source_id, type: page.type, revision, ...quotedPageMeta({ slug: page.slug, title: page.title, frontmatter: page.frontmatter ?? {} }, input.quote === true, tags),
+    ...(page.deleted_at ? { deleted_at: page.deleted_at } : {}),
+    ...(trust ?? {}), ...extras, ...(input.quote ? { quoted: 'transcript' } : {}),
   };
   const omitted = quarantined?.body_omitted === true;
   const mode = req.mode === 'auto' ? 'outline' : req.mode;
-  if (omitted) return { ...base, body: mode, truncated: true, body_omitted: true };
-  // Wave B PR 1: a segmented body is never loaded; `none` reports its stored size (windows arrive with the segment reader).
-  if (mode === 'none' && isSegmentedPage(page)) {
-    return noneResult(ctx, page, { ...base, body: mode, view: req.view, body_storage: 'segmented', size: { body_bytes: Number(page.body_bytes ?? 0) } }, true);
-  }
+  if (omitted) return { ...base, body: mode, truncated: true, body_omitted: true, chars: 0 };
 
   const markdown = req.view === 'markdown';
-  const doc: PageDocument = markdown
-    ? { bytes: Buffer.from(serializePageToMarkdown(input.visibleBody, tags), 'utf8'), timelineByte: -1 }
-    : await readPageDocument(ctx.engine, page);
-  const size: Record<string, unknown> = {
-    total_bytes: doc.bytes.length, total_lines: totalLines(doc.bytes),
-    ...(doc.timelineByte >= 0 ? { timeline_byte_start: doc.timelineByte } : {}),
-    ...(markdown ? { sha256: sha256Hex(doc.bytes) } : {}),
+  let doc: WindowDocument;
+  let size: Record<string, unknown>;
+  if (isSegmentedPage(page)) ({ doc, size } = await segmentedWindows(ctx, input, req, mode));
+  else {
+    const whole: PageDocument = markdown
+      ? { bytes: Buffer.from(serializePageToMarkdown(input.visibleBody, tags), 'utf8'), timelineByte: -1 }
+      : await readPageDocument(ctx.engine, page);
+    size = {
+      total_bytes: whole.bytes.length, total_lines: totalLines(whole.bytes),
+      ...(whole.timelineByte >= 0 ? { timeline_byte_start: whole.timelineByte } : {}),
+      ...(markdown ? { sha256: sha256Hex(whole.bytes) } : {}),
+      ...(mode === 'none' ? await inlineTailDigest(ctx.engine, page.id, ctx.remote !== false) : {}),
+    };
+    doc = inlineDocument(whole);
+  }
+  const out: Record<string, unknown> = { ...base, body: mode, view: req.view, ...(doc.segmented ? { body_storage: 'segmented' } : {}), size };
+  // A segmented read is returned only while the page is still at the revision its caller was authorized for.
+  const confirmed = async (result: Record<string, unknown>) => {
+    if (doc.segments) await confirmBodyPin(ctx.engine, doc.segments.body);
+    const text = (result.window as { text?: unknown } | undefined)?.text;
+    return 'chars' in result ? result : { ...result, chars: typeof text === 'string' ? text.length : 0 };
   };
-  const out: Record<string, unknown> = { ...base, body: mode, view: req.view, size };
+  if (req.slice) {
+    const budget = await sliceCharBudget(ctx);
+    const sliced = req.slice.kind === 'section'
+      ? await readSection(page, doc.stream(), req.slice.heading, budget, wrap)
+      : await readGrep(doc.stream(), req.slice.term, req.slice.context, budget, wrap);
+    return confirmed({ ...out, ...sliced });
+  }
 
-  if (mode === 'none') return noneResult(ctx, page, out, doc.bytes.length > 0);
+  if (mode === 'none') return confirmed(await noneResult(ctx, page, out, doc.total > 0));
 
   if (mode === 'outline') {
     const limit = Math.min(MAX_OUTLINE_LIMIT, DEFAULT_OUTLINE_LIMIT);
-    out.outline = pageOutline(doc.bytes, req.outlineFrom, limit);
+    out.outline = await doc.outline(req.outlineFrom, limit);
     if (req.mode === 'auto') {
-      const first = windowFrom(doc.bytes, 0, await windowBudget(ctx, req.maxBytes, AUTO_WINDOW_BYTES));
-      out.window = { ...first, text: envelopeText(first.text, quarantined, trust) };
+      const first = await doc.from(0, await windowBudget(ctx, req.maxBytes, AUTO_WINDOW_BYTES));
+      out.window = { ...first, text: wrap(first.text) };
       out.truncated = true;
-      if (first.byte_end < doc.bytes.length) setNext(out, page, encodeCursor({ page_id: page.id, revision, view: 'read', offset: first.byte_end, max_bytes: req.maxBytes ?? DEFAULT_WINDOW_BYTES }), false);
+      if (first.byte_end < doc.total) setNext(out, page, encodeCursor({ page_id: page.id, revision, view: 'read', offset: first.byte_end, max_bytes: req.maxBytes ?? DEFAULT_WINDOW_BYTES }), false);
       out.auto_reason = 'over_inline_bytes';
-      return out;
+      return confirmed(out);
     }
-    return { ...out, truncated: true };
+    return confirmed({ ...out, truncated: true });
   }
 
   // window: chosen, then measured as the final encoded frame; text that escapes heavily shrinks the window until it fits.
-  const sel = req.selector;
+  let sel = req.selector;
+  const fallbacks = [...(req.fallbacks ?? [])];
+  const failed: Array<[string, string]> = [];
+  const note = (applied: Selector) => {
+    const ignored = [selectorParam(req.selector!), ...(req.ignored ?? [])].filter(k => k !== selectorParam(applied));
+    out.window_selector = selectorNote(applied, ignored, failed);
+  };
+  if (sel && req.ignored) note(sel);
   let cursorMax = req.maxBytes ?? DEFAULT_WINDOW_BYTES;
   const select = async (maxBytes: number): Promise<WindowSlice | null> => {
-    if (!sel) return windowFrom(doc.bytes, 0, maxBytes);
-    if (sel.kind === 'lines') return windowForLines(doc.bytes, sel.from, sel.count, maxBytes);
-    if (sel.kind === 'bytes') return windowForBytes(doc.bytes, sel.offset, Math.min(sel.length, maxBytes));
+    const fallBack = (e: unknown, key: string, why: string): Promise<WindowSlice | null> => {
+      const next = fallbacks.shift();
+      if (!next) throw e;
+      failed.push([key, why]);
+      sel = next;
+      note(next);
+      return select(maxBytes);
+    };
+    if (!sel) return doc.from(0, maxBytes);
+    if (sel.kind === 'lines') return doc.lines(sel.from, sel.count, maxBytes);
+    if (sel.kind === 'bytes') return doc.bytes(sel.offset, Math.min(sel.length, maxBytes));
     if (sel.kind === 'cursor') {
       const c = decodeCursor(sel.raw);
       if (!c || c.page_id !== page.id) {
-        throw invalidParam(ctx, 'get_page', 'cursor', `get_page: cursor is not a window cursor for page ${page.slug}.`, { example: 'gpw1.…' });
+        return fallBack(invalidParam(ctx, 'get_page', 'cursor', `get_page: cursor is not a window cursor for page ${page.slug}.`, { example: 'gpw1.…' }),
+          'cursor', 'the cursor is not a window cursor for this page');
       }
       if (c.view !== req.view) {
-        throw invalidParam(ctx, 'get_page', 'view', `get_page: this cursor pages view '${c.view}'; pass view: '${c.view}' with it.`, { choices: ['read', 'markdown'], example: c.view });
+        return fallBack(invalidParam(ctx, 'get_page', 'view', `get_page: this cursor pages view '${c.view}'; pass view: '${c.view}' with it.`, { choices: ['read', 'markdown'], example: c.view }),
+          'cursor', `the cursor pages view '${c.view}'`);
       }
       if (c.revision !== revision) {
-        const position = Math.min(c.offset, doc.bytes.length);
-        throw opError('revision_changed', `Page ${page.slug} changed since this cursor was issued (revision ${c.revision}, now ${revision}).`,
+        const position = Math.min(c.offset, doc.total);
+        return fallBack(opError('revision_changed', `Page ${page.slug} changed since this cursor was issued (revision ${c.revision}, now ${revision}).`,
           `Continue from the same byte offset at the current revision (bytes: { offset: ${position}, length: ${c.max_bytes} }), or start over from the outline.`,
           { legacy_error: 'invalid_params', detail: JSON.stringify({ revision, cursor_revision: c.revision, offset: position }),
             fix: readFix('Reads on from the same byte offset at the current revision.', { argv: ['gbrain', 'get', '--source', page.source_id, '--', page.slug],
-              mcp: { tool: 'get_page', arguments: { slug: page.slug, source_id: page.source_id, body: 'window', ...(markdown ? { view: 'markdown' } : {}), bytes: { offset: position, length: c.max_bytes } } } }) });
+              mcp: { tool: 'get_page', arguments: { slug: page.slug, source_id: page.source_id, body: 'window', ...(markdown ? { view: 'markdown' } : {}), bytes: { offset: position, length: c.max_bytes } } } }) }),
+          'cursor', 'the page changed since the cursor was issued');
       }
       cursorMax = c.max_bytes;
-      return windowFrom(doc.bytes, c.offset, Math.min(c.max_bytes, maxBytes));
+      return doc.from(c.offset, Math.min(c.max_bytes, maxBytes));
     }
-    const around = await aroundChunk(ctx, page, doc, sel.chunkId, req.contextLines, maxBytes, revision);
+    const chunkId = sel.chunkId;
+    let around: Awaited<ReturnType<typeof aroundChunk>>;
+    try { around = await aroundChunk(ctx, page, doc, chunkId, req.contextLines, maxBytes, revision); }
+    catch (e) {
+      if (!(e instanceof OperationError) || (e.canonical ?? e.code) !== 'revision_changed') throw e;
+      return fallBack(e, 'around_chunk_id', `around_chunk_id ${chunkId} is not on this page at its current revision`);
+    }
     out.anchor = around.anchor;
     if (around.span) out.chunk_span = around.span;
     // T46: no exact position for the chunk, so no estimated neighborhood either: the chunk itself, without coordinates.
-    if (!around.window) out.window = { text: envelopeText(around.chunkText, quarantined, trust) };
+    if (!around.window) out.window = { text: wrap(around.chunkText) };
     return around.window;
   };
   const cap = await resultByteCap({ remote: ctx.remote, transport: ctx.transport, engine: ctx.engine, config: ctx.config });
-  let maxBytes = await windowBudget(ctx, req.maxBytes ?? (sel?.kind === 'cursor' ? decodeCursor(sel.raw)?.max_bytes : undefined), DEFAULT_WINDOW_BYTES);
+  const startCursor = sel?.kind === 'cursor' ? decodeCursor(sel.raw) : null;
+  const cursorReads = startCursor !== null && startCursor.page_id === page.id && startCursor.view === req.view && startCursor.revision === revision;
+  let maxBytes = await windowBudget(ctx, req.maxBytes ?? (cursorReads ? startCursor.max_bytes : undefined), DEFAULT_WINDOW_BYTES);
   for (let attempt = 0; ; attempt++) {
     const win = await select(maxBytes);
-    if (!win) return { ...out, truncated: true };
-    out.window = { ...win, text: envelopeText(win.text, quarantined, trust) };
-    out.truncated = win.byte_start > 0 || win.byte_end < doc.bytes.length;
-    if (win.byte_end < doc.bytes.length) setNext(out, page, encodeCursor({ page_id: page.id, revision, view: req.view, offset: win.byte_end, max_bytes: cursorMax }), markdown);
+    if (!win) return confirmed({ ...out, truncated: true });
+    out.window = { ...win, text: wrap(win.text) };
+    const target = markdown || typeof win.byte_start !== 'number' ? undefined : await editTarget(ctx, page, doc, win, revision);
+    if (target) out.edit_target = target; else delete out.edit_target;
+    out.truncated = win.byte_start > 0 || win.byte_end < doc.total;
+    if (win.byte_end < doc.total) setNext(out, page, encodeCursor({ page_id: page.id, revision, view: req.view, offset: win.byte_end, max_bytes: cursorMax }), markdown);
     else { delete out.next_cursor; delete out.next; }
-    if (!Number.isFinite(cap) || attempt >= 6) return out;
+    if (!Number.isFinite(cap) || attempt >= 6) return confirmed(out);
     const frame = encodedFrameBytes({ content: [{ type: 'text', text: JSON.stringify(out) }] }) + ENVELOPE_RESERVE_BYTES - FRAME_RESERVE_BYTES;
-    if (frame <= cap || win.byte_end - win.byte_start <= 1) return out;
+    if (frame <= cap || win.byte_end - win.byte_start <= 1) return confirmed(out);
     maxBytes = Math.max(1, Math.floor((win.byte_end - win.byte_start) * (cap / frame) * 0.9));
   }
 }
@@ -408,14 +657,15 @@ export async function fetchWindowResult(ctx: OperationContext, input: PartialRea
   const { page, revision, tags, quarantined, trust } = input;
   const { partial, anchorStatus } = await readFetchWindow(ctx, input, anchor);
   const w = partial.window ?? { text: '' };
+  const meta = quotedPageMeta(page, input.quote === true, tags);
   return {
     id,
-    title: page.title,
+    title: meta.title,
     text: w.text,
     url: deepResearchPageUrl(page.source_id, page.slug),
     metadata: {
-      revision, type: page.type, source_id: page.source_id, updated_at: page.updated_at, tags, ...(quarantined ? { quarantined } : {}), ...(trust ?? {}),
-      truncated: true, total_bytes: partial.size?.total_bytes, anchor: anchorStatus,
+      revision, type: page.type, source_id: page.source_id, updated_at: page.updated_at, tags: meta.tags, ...(quarantined ? { quarantined } : {}), ...(trust ?? {}),
+      ...(input.quote ? { quoted: 'transcript' } : {}), truncated: true, total_bytes: partial.size?.total_bytes, anchor: anchorStatus,
       ...(typeof w.byte_start === 'number' ? { window: { byte_start: w.byte_start, byte_end: w.byte_end, line_start: w.line_start, line_end: w.line_end } } : {}),
       ...(partial.next_cursor ? { next_id: encodeDeepResearchId(page.source_id, page.slug, { cursor: partial.next_cursor }) } : {}),
     },

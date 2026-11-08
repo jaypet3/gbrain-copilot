@@ -15,8 +15,8 @@ import { discoverGitRoot } from '../sync-git.ts';
 import { isInsideGitRepo, hasTrackedContent } from '../git-remote.ts';
 import { containsPath, getWorktreeBinding, humanManifestProgress, type WorktreeBinding, type WorktreeManifest, worktreeManifest } from './ownership.ts';
 import { manifestDifferences, storedManifestScope, type WorktreeManifestScope } from './worktree-manifest.ts';
-import { localHostId } from './identity.ts';
-import { advanceTopology, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
+import { hostIdFor } from './identity.ts';
+import { advanceTopology, inspectTopologyPhysicalRoot, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
 import { priorTopologyChange, recordTopologyChange, topologyReceipt } from './topology-receipts.ts';
 import { isWriteRequestId } from './types.ts';
 import { withCoordinatedWrite } from './context.ts';
@@ -28,6 +28,8 @@ import { claimPhysicalRoot } from './physical-root.ts';
 import { inspectRelocatedPhysicalRoot, relocatePhysicalRoot } from './physical-root-record.ts';
 import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
+import { rebindContentReceipts } from '../shared-skills/receipt-root.ts';
+import { assertLinkedWorktreeIntact } from './worktree-link.ts';
 
 export interface SourceLifecycleInput {
   operation:'add'|'claim'|'archive'|'restore'|'remove'|'purge'|'rebind'|'reclone';
@@ -58,6 +60,7 @@ function localRoot(path:string,create=false):{source:string;worktree:string}{
     'The path names a file. Pass the directory that holds the source content, then rerun the command; nothing was changed.');
   let worktree=source;
   let ancestor=source;while(!existsSync(ancestor))ancestor=dirname(ancestor);
+  assertLinkedWorktreeIntact(ancestor);
   try{worktree=realpathSync(discoverGitRoot(ancestor));}catch{/* directory source */}
   return {source,worktree};
 }
@@ -65,7 +68,7 @@ function localRoot(path:string,create=false):{source:string;worktree:string}{
 export async function installTopologyBinding(tx:BrainEngine,sourceId:string,incarnation:string,root:{source:string;worktree:string},bindings:WorktreeBinding[]):Promise<string>{
   const others=await tx.executeRaw<{source_id:string;relative_path:string;local_path:string}>(`SELECT b.source_id,b.relative_path,h.local_path
     FROM persistence_source_bindings b JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid
-    WHERE b.source_id<>$2`,[localHostId(),sourceId]);
+    WHERE b.source_id<>$2`,[hostIdFor(tx),sourceId]);
   const sourcePath=nativeFilesystemPath(root.source);
   const overlap=others.find(other=>{const path=nativeFilesystemPath(join(other.local_path,other.relative_path));return containsPath(path,sourcePath)||containsPath(sourcePath,path);});
   if(overlap) throw opError('overlapping_path','Sources cannot claim overlapping canonical directories.',
@@ -77,13 +80,13 @@ export async function installTopologyBinding(tx:BrainEngine,sourceId:string,inca
     `The directory for '${sourceId}' contains the checkout of source '${overlapping.source_id}'. Move that source first with gbrain sources set-path ${overlapping.source_id} and its verified new directory (a topology change the user decides), or choose a directory that does not enclose it.`,
     {fix:ownerStatusFix(overlapping.source_id)});
   const worktree=compatible?.local_path??root.worktree;
-  const physical=await claimPhysicalRoot(tx,worktree,{hostId:localHostId(),
+  const physical=await claimPhysicalRoot(tx,worktree,{hostId:hostIdFor(tx),
     ...(compatible?{worktreeId:compatible.worktree_id,coordinationPath:compatible.coordination_path!}:{})});
   const id=physical.worktreeId;
   const [existing]=await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid',[id]);
-  if(!existing)await tx.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id,owner_epoch) VALUES($1::uuid,$2::uuid,1)',[id,localHostId()]);
+  if(!existing)await tx.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id,owner_epoch) VALUES($1::uuid,$2::uuid,1)',[id,hostIdFor(tx)]);
   await tx.executeRaw(`INSERT INTO persistence_host_bindings(worktree_id,host_id,local_path,coordination_path) VALUES($1::uuid,$2::uuid,$3,$4)
-    ON CONFLICT(worktree_id,host_id) DO NOTHING`,[id,localHostId(),worktree,physical.coordinationPath]);
+    ON CONFLICT(worktree_id,host_id) DO NOTHING`,[id,hostIdFor(tx),worktree,physical.coordinationPath]);
   const rel=relative(nativeFilesystemPath(worktree),nativeFilesystemPath(root.source)).split(sep).join('/');
   await tx.executeRaw(`INSERT INTO persistence_source_bindings(source_id,source_incarnation,worktree_id,relative_path,topology_generation)
     SELECT $1,$2::uuid,$3::uuid,$4,topology_generation FROM persistence_worktrees WHERE id=$3::uuid
@@ -131,7 +134,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   if(prior) return topologyReceipt(prior);
   if(input.requireGitContent&&input.path&&(!isInsideGitRepo(input.path)||!hasTrackedContent(input.path)))
     throw opError('not_a_git_repo','The source path must contain committed Git content. Use --force to register an ordinary directory.',
-      `Commit the content in that directory with git first, or, if '${input.sourceId}' is meant to be a plain directory, rerun the add with --force; nothing was registered.`);
+      `Commit the content in that directory with git first, or, if '${input.sourceId}' is meant to be a plain directory, rerun the add with --force (sync then imports its files without Git; a file removed from it keeps its page); nothing was registered.`);
   if(input.operation==='reclone'||input.operation==='add'&&input.remoteUrl){
     const {runManagedSourceClone}=await import('./topology-clone.ts');
     return runManagedSourceClone(engine,input,principal,requestId,intent);
@@ -155,6 +158,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   const retire=['archive','remove','purge'].includes(input.operation);
   const manifestRequired=!retire||(await engine.executeRaw<{digest:string|null}>(
     `SELECT w.manifest->>'digest' AS digest FROM persistence_source_bindings b JOIN persistence_worktrees w ON w.id=b.worktree_id WHERE b.source_id=$1`,[input.sourceId])).some(row=>!row.digest);
+  if(input.dryRun) await inspectTopologyPhysicalRoot(engine,input.sourceId,root?.worktree,{relocation:input.operation==='rebind'});
   if(input.dryRun) return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null,manifest_required:manifestRequired};
   return withTopologyLocks(engine,input.sourceId,async bindings=>{
     // Hash canonical bytes while holding native exclusion, without a database
@@ -255,13 +259,13 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       }else if(input.operation==='archive') await tx.executeRaw(`UPDATE sources SET archived=true,archived_at=COALESCE(archived_at,now()),
         archive_expires_at=COALESCE(archive_expires_at,now()+interval '72 hours'),config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:false})]);
       else if(input.operation==='restore') await tx.executeRaw(`UPDATE sources SET archived=false,archived_at=NULL,archive_expires_at=NULL,
-        config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:input.refederate!==false})]);
+        config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:input.refederate!==false&&source?.config?.qm_scope!==true})]);
       else if(input.operation==='rebind'&&relocated){
         // #5914 (P1.3c): the recorded root now resolves through a symlink to the new directory; the worktree keeps its id
         // and its ownership records move to the real path (reservation under the new sha256(root) name, stamp naming it).
         const moved=relocatePhysicalRoot(currentBinding!.local_path!,root!.worktree,relocated);
         await tx.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[input.sourceId,root!.source]);
-        await tx.executeRaw('UPDATE persistence_host_bindings SET local_path=$3 WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[currentBinding!.worktree_id,localHostId(),moved.root]);
+        await tx.executeRaw('UPDATE persistence_host_bindings SET local_path=$3 WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[currentBinding!.worktree_id,hostIdFor(tx),moved.root]);
         const rel=relative(nativeFilesystemPath(moved.root),nativeFilesystemPath(root!.source)).split(sep).join('/');
         await tx.executeRaw('UPDATE persistence_source_bindings SET relative_path=$2 WHERE source_id=$1',[input.sourceId,rel]);
         manifests.set(moved.root,manifests.get(root!.worktree)!);
@@ -278,9 +282,10 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
         await tx.executeRaw('DELETE FROM sources WHERE id=$1 AND incarnation=$2::uuid',[input.sourceId,incarnation]);
         await tx.executeRaw('DELETE FROM persistence_source_bindings WHERE source_id=$1 AND source_incarnation=$2::uuid',[input.sourceId,incarnation]);
       }
+      const contentReceipts=input.operation==='rebind'?await rebindContentReceipts(tx,worktrees,hostIdFor(tx),relocated?undefined:[input.sourceId]):[];
       await advanceTopology(tx,worktrees);
       for(const id of worktrees){
-        const [host]=await tx.executeRaw<{local_path:string}>('SELECT local_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[id,localHostId()]);
+        const [host]=await tx.executeRaw<{local_path:string}>('SELECT local_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[id,hostIdFor(tx)]);
         if(host&&manifests.has(host.local_path)) await tx.executeRaw('UPDATE persistence_worktrees SET manifest=$2::text::jsonb WHERE id=$1::uuid',[id,JSON.stringify({...manifests.get(host.local_path),canonical_stamp:await topologyCanonicalStamp(tx,id)})]);
         else if(!manifestRequired&&host) await tx.executeRaw(`UPDATE persistence_worktrees SET manifest=COALESCE(manifest,'{}'::jsonb)||jsonb_build_object('canonical_stamp',$2::text) WHERE id=$1::uuid`,[id,await topologyCanonicalStamp(tx,id)]);
       }
@@ -288,7 +293,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       // stale installations cannot write after a source moved or disappeared.
       await refreshManagedFilesystemRoots(tx,managedFilesystemDatastorePath(engine));
       return {operation:input.operation,source_id:input.sourceId,source_incarnation:incarnation,invalidated_requests:invalidated,
-        ...(missingCheckout?{retired_without_checkout:missingCheckout}:{}),
+        ...(missingCheckout?{retired_without_checkout:missingCheckout}:{}),...(contentReceipts.length?{content_receipts:contentReceipts}:{}),
         ...(root?{local_path:root.source}:{}),...(['remove','purge'].includes(input.operation)?{storage_retained:true,local_path:ownedSourcePath??null,pages_deleted:pagesDeleted}:{}),
         ...(input.operation==='add'?{name:input.name??source?.name??input.sourceId,config:redactSourceConfig({...source?.config,...input.config}),id:input.sourceId}: {})};
     },principalAttribution({kind:'local_cli',id:principal}));

@@ -5,10 +5,10 @@
  */
 
 import type { SearchResult } from '../types.ts';
-import { projectedLead } from '../page-window/bounded-lead.ts';
+import { pageLeadSource, projectedLead } from '../page-window/bounded-lead.ts';
 import { isIdentityEntity } from '../entities/resolve.ts';
 import { normalizeAlias } from './alias-normalize.ts';
-import { isPrivatePage } from './private-visibility.ts';
+import { isPrivatePageForCaller } from './private-visibility.ts';
 
 // T3 — free-text alias hop tuning.
 const ALIAS_HOP_PRESENT_BOOST = 1.10; // bounded boost when canonical already in results
@@ -219,7 +219,7 @@ async function fetchAliasCanonical(
   // #4352 — the alias inject path bypasses the engines' SQL visibility
   // clause (getPage, not search); re-apply the private predicate here so
   // an untrusted caller can't hop into a `visibility: private` page.
-  if (opts.excludePrivate && isPrivatePage(page)) return null;
+  if (opts.excludePrivate && isPrivatePageForCaller(page)) return null;
   return page;
 }
 
@@ -235,7 +235,7 @@ async function aliasInjectedRow(engine: import('../engine.ts').BrainEngine, page
     type: page.type,
     source_id: page.source_id ?? ref.source_id,
     // Large pages: a bounded, withdrawal-overlaid prefix is sanitized, never the whole body.
-    chunk_text: (await projectedLead(engine, { slug: page.slug, source_id: page.source_id ?? ref.source_id, compiled_truth: page.compiled_truth })).slice(0, 200),
+    chunk_text: (await projectedLead(engine, { slug: page.slug, source_id: page.source_id ?? ref.source_id, compiled_truth: await pageLeadSource(engine, page) })).slice(0, 200),
     chunk_index: 0,
     chunk_id: 0,
     score,

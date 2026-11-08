@@ -188,7 +188,7 @@ outcomes and reasons, never values), and `classified` counts the batch:
 
 | Classification | Meaning | Next step |
 | --- | --- | --- |
-| `structurally_additive` | Only additive metadata changed: a `contacts` list with entries appended after every stored entry (order and repeats kept), an activity date that moved forward (`updated`, `last_*`, `*_last_used`), or a field present on one side only. | Preview with `--auto-additive`, then apply. |
+| `structurally_additive` | Only additive metadata changed: a `contacts` list with entries appended after every stored entry (order and repeats kept) or whose stored rows changed only by an activity date moving forward (a row's `last_used`), an activity date that moved forward (`updated`, `last_*`, `*_last_used`), or a field present on one side only. | Preview with `--auto-additive`, then apply. |
 | `additive_with_suggestions` | The above, plus body or timeline lines inserted without changing or removing any stored line. | Read the inserted lines, then preview with `--auto-additive --accept-suggested`. |
 | `review_required` | Stored text changed or was removed; or a policy, privacy, title, type, tag, alias or fence change; or a date that moved backward, changed format or is in the future. | Resolve manually as above, after asking the user. |
 | `formatting_only` | The parsed content already agrees. | Preview; the result is the database content. |
@@ -262,7 +262,7 @@ own `fix` and a link to this section:
 
 | `reason` | Cause | Next step |
 | --- | --- | --- |
-| `file_database_drift` | The file was edited outside a coordinated write, or it is older than the database copy. | Run the `fix` (a reconcile preview), then resolve and apply it as described in [Repair a file/database disagreement](#repair-a-filedatabase-disagreement). |
+| `file_database_drift` | The file was edited outside a coordinated write, or it is older than the database copy. | Run the `fix` (a reconcile preview), then resolve and apply it as described in [Repair a file/database disagreement](#repair-a-filedatabase-disagreement). A source with `persistence.adopt_local_edits.source.<id>` on adopts a one-sided edit for `remember`, `capture` and `add_timeline_entry` instead ([file_database_drift](write-refusals.md#file_database_drift)). |
 | `held_file` | Sync holds the file because it cannot import it. | Run the hold repair in `fix` (for example `gbrain repair frontmatter --source workspace`), as in [held files](repair.md#held-files). |
 | `canonical_file_missing` | The file was removed while lint ran. | Recover the file or import the deletion; reconciliation does not restore missing files. |
 | `revision_changed` | Another write published the page while lint ran. | Nothing; the next cycle lints the current revision. `fix` reads the page as it is now. |
@@ -346,11 +346,18 @@ Receipts include `request_id`, `state`, and `retry_after_ms`, with optional
 revision, outcome, persistence status, and timestamps. Terminal receipts have
 `retry_after_ms: null`. Private queued content, credential hashes, and recovery
 bytes are never part of the receipt.
+A committed write of a page stored in segments also says whether search sees
+it yet: `searchable: true`, or `searchable: "pending"` with
+`searchable_retry_after_ms` and `searchable_fix` (read the receipt again) while
+its chunks are built after commit; see
+[when a segmented write is searchable](memory-boundaries.md#segmented-searchable).
 
 Nonterminal receipts may include a validated `diagnostic` with `age_ms`,
 `assessment` (`pending`, `blocked`, or `stalled`), a closed `reason`, and
-`next_action` (`poll` or `inspect_owner`). An optional `observed_at` is the
-observation time, not the last useful progress time. Older servers may omit
+`next_action` (`poll` or `inspect_owner`). An optional `owner` block (`last_active`)
+appears when the worktree's owner host runs no consumer and has been quiet past
+the stale window ([stale owner](troubleshooting.md#owner-host-stale)). An optional
+`observed_at` is the observation time, not the last useful progress time. Older servers may omit
 diagnostics. A fallback without fresh dependency evidence omits the observation
 timestamp; it does not claim that a cached row is current.
 
@@ -378,7 +385,8 @@ arguments with that UUID. When `next_action` is `inspect_owner`, ask the operato
 to inspect first instead of repeatedly submitting mutations.
 
 `write_pending` means accepted work remains outstanding; the CLI exits 10 for it
-(0 with `--accept-pending`) and waits 30 s by default (`--wait <seconds>`,
+(0 with `--accept-pending`, except for a receipt whose `diagnostic.owner` names a stale
+owner) and waits 30 s by default (`--wait <seconds>`,
 `GBRAIN_WRITE_WAIT_MS`, `persistence.write_wait_ms`); see
 [CLI exit status for writes](../protocol/MEMORY_VERBS_v1.md#cli-exit-status-for-writes).
 The admin health indicators count it as `accepted_pending`, outside the error
@@ -498,6 +506,12 @@ on providers. `withdrawal_capacity` or `withdrawal_provenance` refuses the
 attempt before ledger, expiry, revision or chunk changes. Matching malformed
 fences need canonical repair.
 
+A facts fence that crosses a forced segment cut is read whole and checked in
+one batch, so one such fence over 16,384 rows (or 8 MiB of rows to check)
+refuses `withdrawal_capacity` with reason `split_fence_rows`, naming the page
+and the fence's row count. Split that fence into fences of at most 16,384 rows,
+write the page again, then retry.
+
 When the claim itself is carried by more than 256 pages, the refusal names the
 matched count and up to 20 matched pages. Reduce the matched set, then retry:
 forget the entity-scoped copies of the fact first (each withdrawal changes only
@@ -531,11 +545,11 @@ If its recorded file bytes no longer match, preserve the file and receipt and
 resolve the conflict on the owner; do not delete recovery records.
 
 If a sync cursor was already invalidated, keep its failure visible until the
-owner has checked the canonical content. Then explicitly re-enumerate with the
-same source and processing options:
+owner has checked the canonical content. Then rerun the plain sync with the
+same source and processing options; it retries what the previous run recorded:
 
 ```bash
-gbrain sync --source example-source --no-pull --no-embed --no-extract --retry-failed
+gbrain sync --source example-source --no-pull --no-embed --no-extract
 ```
 
 Use `--no-embed` and `--no-extract` here only if they were the original sync
@@ -860,7 +874,7 @@ Default admission limits are enforced atomically:
 | Queued intent bytes | 32 MiB | 256 MiB |
 | Lifetime request IDs | 2,000,000 | 8,000,000 |
 | Terminal receipt reservation | 16 GiB | 64 GiB |
-| Recovery bytes | — | 1 GiB, also 256 MiB per worktree |
+| Recovery bytes | — | 1 GiB, also 256 MiB per worktree (with `pages.segmented_storage on`: twice `pages.max_bytes` plus 2 MiB, at least 256 MiB) |
 
 Completion space is reserved at admission. Beforeimage/recovery bytes are
 reserved before filesystem publication. Reaching a limit refuses additional
@@ -955,8 +969,15 @@ Two read-only doctor checks watch the receipt-bytes accounting:
   (brain and every principal) with what the receipts hold
   (`terminal_reservation` per request plus lifecycle receipts) in one
   statement, and reports `persistence.true_up.clamped`, the number of
-  settle-time decrements that were clamped at zero. A positive delta charges
-  capacity no receipt holds; a negative one under-counts. It changes nothing.
+  settle-time decrements that were clamped at zero. Each drifting scope in
+  `details.drift` names its `direction`: `overcharge` (a positive delta) is a
+  bounded charge against write capacity that no receipt holds, so writes are
+  refused a little early and no data is lost; `undercount` (a negative delta)
+  lets writes use capacity the receipts already reserve. `receipts_by_kind`
+  splits the receipt side into `requests` and `topology_changes` (rows and
+  bytes), and `details.incident` is `current` because the comparison is
+  live. It changes nothing, and there is no reconcile repair yet: report a
+  persistent drift with `gbrain doctor --only persistence_counter_drift --json`.
 - `persistence_compaction` reads `persistence.maintenance.last_compaction`,
   the record each resident consumer's compaction pass writes (`at`,
   `host_id`, `compacted`, `freed_bytes`, `skipped_by_reason`), and warns when
@@ -972,7 +993,11 @@ When `persistence_capacity` warns or fails, or a write is refused with
 
 1. Read the finding: `gbrain doctor --only persistence_capacity --json`.
    `details.resources[]` names the scope, resource, days left and `basis`;
-   `fix` is the reversible unblock.
+   `fix` is the reversible unblock. `details.outstanding[]` lists an
+   outstanding-request cap at 90% or more whose oldest request is over ten
+   minutes old (a healthy drain near the line stays ok), with the sources holding its slots;
+   requests that stopped settling (or wait behind a slow publication) hold them, so when it is the only finding, `fix`
+   is that source's read-only `gbrain sources writer status`, not a raise.
 2. Run the `gbrain config set <key> <value>` it prints on the brain host
    (undo with `gbrain config unset <key>`). Writes resume at once; retry the
    refused write with the same `request_id`.
@@ -985,7 +1010,7 @@ stored, and compaction frees the window's reservations as receipts age out.
 within `persistence.capacity.warn_days` (default 30), adds the
 `[gbrain notice write_capacity_low]` notice (kind `info`) with the same
 `gbrain config set` command. Write and sync receipts carry it at most once an
-hour per process per scope (a remote client sees only the brain and its own
+hour per engine per scope (a remote client sees only the brain and its own
 principal); `gbrain sync status`, doctor and autopilot cycle output carry it
 every time. `gbrain notices mute write_capacity_low` mutes it on receipts;
 doctor still reports it. When a cap passes

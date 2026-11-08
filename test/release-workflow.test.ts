@@ -13,6 +13,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EXPECTED_BUILDER_IDS, expectedAssetName } from '../src/core/binary-self-update.ts';
+import { DEFAULT_BRANCH, GITHUB_URL } from '../src/core/repo-coordinates.ts';
 
 const ROOT = join(import.meta.dir, '..');
 const WORKFLOW = readFileSync(join(ROOT, '.github/workflows/release.yml'), 'utf8');
@@ -29,7 +30,7 @@ describe('release.yml ↔ binary-self-update asset contract', () => {
   test('release compiler is covered by the required native runtime matrix', () => {
     const build = WORKFLOW.slice(WORKFLOW.indexOf('  build:'), WORKFLOW.indexOf('  release:'));
     const compiler = build.match(/bun-version:\s*(\S+)/)?.[1];
-    expect(compiler).toBe('1.4.3');
+    expect(compiler).toBe('1.4.4');
     const native = readFileSync(join(ROOT, '.github/workflows/native-locks.yml'), 'utf8');
     const matrices = [...native.matchAll(/bun:\s*\[([^\]]+)\]/g)];
     expect(matrices).toHaveLength(4);
@@ -90,13 +91,11 @@ describe('release.yml ↔ binary-self-update asset contract', () => {
     // verifyIntegrity accepts only attestations whose builder id is exactly
     // release.yml@<trusted ref>. If the workflow file is renamed or the ref
     // scheme changes, this test forces the constant to move in lockstep.
-    for (const id of EXPECTED_BUILDER_IDS) {
-      expect(id).toContain('/.github/workflows/release.yml@');
-      const ref = id.split('@')[1]!;
-      expect(ref.startsWith('refs/')).toBe(true);
-    }
-    // The workflow this repo actually ships from is the one the ids name.
-    expect(EXPECTED_BUILDER_IDS.some((id) => id.endsWith('@refs/heads/master'))).toBe(true);
+    const pushedBranch = WORKFLOW.match(/push:\s*\n\s*branches:\s*\[([^\]]+)\]/)?.[1]?.trim();
+    expect(pushedBranch).toBe(DEFAULT_BRANCH);
+    expect(EXPECTED_BUILDER_IDS).toEqual([
+      `${GITHUB_URL}/.github/workflows/release.yml@refs/heads/${DEFAULT_BRANCH}`,
+    ]);
   });
 
   test('release builds the admin UI fresh from source before compiling', () => {
@@ -185,6 +184,29 @@ Release summary line.
 });
 
 describe('release.yml publish-template skip is visible (D-10)', () => {
+  test('an unset template destination skips even when a PAT is present', async () => {
+    const { load } = await import('js-yaml');
+    const wf = load(WORKFLOW) as { jobs: Record<string, { env: Record<string, string>; steps: Array<{ id?: string; run?: string }> }> };
+    const job = wf.jobs['publish-template']!;
+    expect(job.env.TEMPLATE_REPO).toBe('${{ vars.TEMPLATE_REPO }}');
+    const gate = job.steps.find(s => s.id === 'gate')!.run!;
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-publish-template-gate-'));
+    try {
+      const output = join(dir, 'output');
+      const summary = join(dir, 'summary');
+      writeFileSync(output, '');
+      const stdout = execFileSync('bash', ['-euo', 'pipefail', '-c', gate], {
+        cwd: ROOT, encoding: 'utf8',
+        env: { PATH: process.env.PATH, TEMPLATE_REPO_PAT: 'test-token', TEMPLATE_REPO: '', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+      });
+      expect(readFileSync(output, 'utf8')).toContain('publish=false');
+      expect(stdout).toContain('TEMPLATE_REPO repository variable');
+      expect(readFileSync(summary, 'utf8')).toContain('TEMPLATE_REPO is unset');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('an empty TEMPLATE_REPO_PAT warns with the owner-only fix and writes a step summary', async () => {
     const { load } = await import('js-yaml');
     const wf = load(WORKFLOW) as { jobs: Record<string, { steps: Array<{ id?: string; run?: string }> }> };

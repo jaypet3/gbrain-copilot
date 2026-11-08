@@ -26,6 +26,7 @@ SETUP
   migrate --to <postgres|pglite>     Move the brain between engines (PGLite -> Postgres graduates: plan, then --yes --expect)
   migrate embeddings --to <p:model>  Re-embed onto another embedding provider
   embeddings enable --embedding-model <p:model>  Turn on embeddings in place (keeps pages/facts)
+  embeddings prewarm [--dry-run]     Load the vector indexes into shared_buffers when they fit (Postgres)
   upgrade                            Self-update
   check-update [--json]              Check for new versions
   repair [<kind>] [--apply]          Preview/apply residual repairs (timeline, visibility, safe-chunks)
@@ -46,6 +47,8 @@ PAGES
   delete <slug>                      Delete a page
   list [--type T] [--tag T] [--limit N]
                                      List pages
+  find <glob|prefix|name> [--type T] [--source S] [--limit N]
+                                     Find pages by slug, path or title
 
 SEARCH
   search <query>                     Keyword search (tsvector)
@@ -111,6 +114,7 @@ TOOLS
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
   backfill <kind|list>               v0.30.1: run a registered backfill (effective-date, ...)
   orphans [--json] [--count]         Find pages with no inbound wikilinks
+  beliefs <enable|status|...>        Belief ledger coverage: enable, disable, status, reconcile, backfill
   salience [--days N] [--kind P]     v0.29: pages ranked by emotional + activity salience
   anomalies [--since D] [--sigma N]  v0.29: cohort-based statistical anomalies (tag, type)
   feedback <status|reset>            retrieval feedback: learned page weights; rate answers with gbrain rate
@@ -191,6 +195,8 @@ JOBS (Minions)
 
 ADMIN
   stats                              Brain statistics
+  stats --by source,type [--since 30d] [--collapse-aliases]
+                                     Live page counts per source and type
   health                             Brain health dashboard
   history <slug> [--json]            Page version history
   revert <slug> <version-id>         Revert to version
@@ -207,6 +213,8 @@ ADMIN
     --surface verbs|starter|full     Tool surface: the 7 memory verbs, the ~20-op
                                      starter set, or every op (default full).
                                      On --http this is the per-client CEILING.
+    --advertise verbs|starter|full   List only this surface in tools/list (plus
+                                     request_tools); the rest stays callable.
     --access read-only|full          stdio: list and dispatch only read operations
   serve --http [--port N]            HTTP MCP server with OAuth 2.1
     --token-ttl N                    Access token TTL in seconds, 60-7776000 (default: 3600)
