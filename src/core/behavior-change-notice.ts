@@ -31,7 +31,7 @@
  * this brain × channel (× client) was shown, or after the brain's baseline
  * when it was never shown one. The baseline (the first gbrain version that
  * saw it, `0` when it already existed) is recorded once under GBRAIN_HOME:
- * `gbrain init` stamps a database it creates with this version; otherwise
+ * `gbrain init` stamps a database it creates with the newest disclosed release; otherwise
  * the first look decides from the recorded upgrade history
  * (`upgrade-state.json` `from` below the newest row) or the brain's own
  * creation time (its oldest `sources.created_at` more than
@@ -56,7 +56,6 @@ import { dirname, join } from 'node:path';
 import type { BrainEngine } from './engine.ts';
 import type { Action, Notice } from './agent-output.ts';
 import { gbrainPath, type GBrainConfig } from './config.ts';
-import { VERSION } from '../version.ts';
 import {
   CHAT_FALLBACK_PLANE_LABEL,
   chatFallbackRemovalFix,
@@ -142,9 +141,9 @@ function writeBaseline(brainKey: string, since: string, exclusive: boolean): voi
   } catch { /* unwritable home or a concurrent first writer: eligibility is re-derived next time */ }
 }
 
-/** `gbrain init` created this brain's database: it is a fresh install at this version. */
+/** `gbrain init` created this brain's database: it starts at the latest disclosed release. */
 export function stampFreshBrainBaseline(brainKey: string): void {
-  writeBaseline(brainKey, VERSION, false);
+  writeBaseline(brainKey, BEHAVIOR_NOTICE_SINCE, false);
 }
 
 /** `gbrain upgrade` recorded an upgrade from a release older than the newest disclosed change. */
@@ -185,7 +184,7 @@ export async function brainBaseline(
   if (recorded) return recorded;
   const now = opts.now ?? Date.now();
   const predates = upgradedAcrossRelease() || (engine !== null && await brainCreatedBefore(engine, now - FRESH_BRAIN_GRACE_MS));
-  const since = predates ? PREDATES : VERSION;
+  const since = predates ? PREDATES : BEHAVIOR_NOTICE_SINCE;
   if (!opts.persist) return since;
   writeBaseline(brainKey, since, true);
   return readBaseline(brainKey) ?? since;
@@ -479,10 +478,10 @@ export const BEHAVIOR_CHANGES: ReadonlyArray<{ since: string; text: ChangeText; 
   // The non-ranking amends link. `since` is provisional; the integrator restamps it at the merge slot.
   { since: '0.60.243.0', text: '`amends` links (a record amending another, declared in a schema pack) no longer feed any ranking signal (backlink and adjacency boosts, relational hops and degree, enrich order, entity resolution, generated-page demotion, entity anchoring), and an amends edge whose `since` is still ahead now shows in default graph reads instead of being hidden. They stay references in get_backlinks, cards and `referenced_by`; `supersedes` still down-ranks a replaced record.' },
   { since: '0.60.243.0', text: 'When several frontmatter relationship objects in one field match the same target, only the one whose name matches it exactly dates it: `{name: MSA, since}` no longer dates `msa-renewal` beside `{name: MSA Renewal, since}`. Re-extracting such a page (`gbrain extract links --source db --include-frontmatter`) records the corrected dates.' },
-  // #6529 (GBRA-79). `since` is provisional: stamped at the current VERSION because a `since` past VERSION discloses on every fresh brain (goldens, notice tests); the integrator restamps both rows to the release (0.60.182.0 placeholder) at the merge slot.
+  // #6529 (GBRA-79). `since` is provisional; fresh baselines follow the newest notice row, and the integrator restamps both rows to the merge-slot release.
   { since: '0.60.182.0', text: 'With `GBRAIN_EMBEDDING_MULTIMODAL=true`, managed sync now imports image files through the coordinated image importer (OCR text, image vector and `source_path` at import) instead of holding them as `managed_image_sync_unsupported`; existing image holds are re-screened and imported on the next `gbrain sync --source <id> --no-pull`. With it off, images stay held as before.' },
   { since: '0.60.182.0', text: 'On a multimodal install, plain `gbrain embed --stale` now runs the image sweep (`--images`) before its text pass and reports it as `images` in `--json`; `gbrain embed --stale --images` works on managed brains, finds an image page with no recorded `source_path` by its slug, and exits non-zero naming the path it tried when no candidate has a file (it used to exit 0); the folded sweep only reports fileless pages. Doctor gains `image_embedding_coverage`.' },
-  // #6530 (GBRA-82) shared-checkout-safe git. `since` is provisional (current VERSION, so a fresh brain sees nothing); restamped at the merge slot.
+  // #6530 (GBRA-82) shared-checkout-safe git. `since` is provisional; fresh baselines follow the newest notice row, and it is restamped at the merge slot.
   { since: '0.60.185.0', text: 'New `gbrain git commit-push` commits only the paths you name and pushes them safely in a brain checkout other agents share: `-m <msg> -- <paths>`, `--push-only`, `--pull` and `--dry-run`. After `gbrain sources harden`, the committed `scripts/brain-commit-push.sh` and the post-commit hook delegate to it and never run `git pull --rebase`, `git stash` or `git reset` in the shared tree. A rejected push is merged with the remote in memory, so brain history now gets merge commits (`gbrain: merge origin/<branch> into <branch>`) instead of rebased linear history; the checkout only fast-forwards, and a push whose fast-forward a dirty file blocks reports `pushed_checkout_lagging` (exit 0). Exit 4 (`push_unconfirmed`) means the commit is local but no push was confirmed. Guide: docs/guides/shared-checkout-git.md.' },
   { since: '0.60.185.0', text: 'Brain checkout commits and pushes now coordinate through two OS locks under the git dir: `brain-commit.lock` for staging, committing and moving the checkout (wait `GBRAIN_COMMIT_LOCK_WAIT_SECONDS`, alias `GBRAIN_PUSH_LOCK_WAIT_SECONDS`, default 60, then `commit_lock_busy`) and `brain-publish.lock` for the network push (a foreground push waits `GBRAIN_PUBLISH_LOCK_WAIT_SECONDS`, default 300, then `push_unconfirmed`). The pre-#6530 `gbrain-push.lock` is still taken with the commit lock. The post-commit hook no longer waits for another push: it reports `push_deferred` and the running push publishes its commit too. `BRAIN_COMMIT_LOCK_HELD` is honored only when it names the lock file\'s path, no longer as `1`.' },
   { since: '0.60.185.0', text: 'gbrain\'s own brain-repo commits (page write-through, facts fences, takes, timeline, `lint --fix`, and `sources harden` scaffolding) now take the checkout\'s commit lock (write-through waits 2 seconds, then commits its one path without it), commit only their own paths, and include both sides of a staged `git mv` rename. Paths passed to the helper or `gbrain git commit-push` are literal: a quoted glob no longer expands and fails `commit_paths_invalid`; name the files.' },
