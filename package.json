@@ -197,6 +197,8 @@
     "check:structural-manifest": "bash scripts/check-structural-manifest.sh",
     "regen:all": "bun scripts/regen-all.ts",
     "release:restamp": "bun scripts/release-restamp.ts",
+    "release:unstamp": "bun scripts/release-restamp.ts --unstamp",
+    "migrations:renumber": "bun scripts/release-restamp.ts --renumber",
     "check:regen-all": "bun scripts/regen-all.ts --check",
     "check:orphan-modules": "node scripts/check-orphan-modules.mjs",
     "check:test-placeholders": "node scripts/check-test-placeholders.mjs",
@@ -265,7 +267,7 @@
   "overrides": {
     "@aws-sdk/util-format-url": "3.972.9",
     "@ai-sdk/provider-utils": "4.0.56",
-    "@hono/node-server": "^2.0.5",
+    "@hono/node-server": "^2.1.6",
     "fast-uri": "^3.1.9",
     "body-parser": "^2.4.0",
     "fast-xml-builder": "^1.1.7",

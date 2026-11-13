@@ -21,19 +21,24 @@ name: Release
 # src/core/binary-self-update.ts, pinned by test/release-workflow.test.ts.
 #
 # CI gate (docs/RELEASING.md#release-ci-gate): the `ci-gate` job waits for
-# the push-to-main run of Test on the release commit
-# (scripts/release-gate.ts). Build, publication and the latest-stable move
-# run only after it succeeds. E2E is dispatch-only. A failed run publishes nothing and the job
-# fails with the next step; a run cancelled by a newer push is followed to
-# the next main commit with the same VERSION (published there) or marks
-# this version superseded; workflow_dispatch backfills main HEAD's VERSION
-# through the same gate.
+# the push-to-main Test run on the release commit; E2E is dispatch-only in
+# this fork. Build, publication and the latest-stable move run only after Test
+# succeeds. Failed, cancelled, or skipped runs publish nothing; a later commit
+# is never published in the release commit's place. workflow_dispatch gates
+# only while main HEAD is the release commit (the commit that last changed
+# VERSION); otherwise it refuses and names the re-run of that commit's push
+# Release run.
+#
+# Releases per batch (docs/RELEASING.md#releases-per-batch): PRs land with
+# changelog.d fragments and no version; a release PR moves VERSION, so this
+# workflow runs once per release. Its ci-gate refuses a commit that still
+# holds an unfolded fragment or a stale behavior-change table.
 
 on:
   push:
     branches: [main]
     paths: [VERSION]
-  workflow_dispatch: {}  # manual first run / backfill of the current VERSION
+  workflow_dispatch: {}  # backfill of the current VERSION while main HEAD is its release commit
 
 permissions:
   contents: read
@@ -87,20 +92,25 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: |
+            .gstack
             scripts
+            changelog.d
+            behavior-changes.d
             src/core/behavior-change-notice.ts
+            src/core/behavior-changes.generated.ts
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: 1.4.4
-      # A since: 'TBD' BEHAVIOR_CHANGES row never ships (scripts/check-behavior-since.ts).
-      - name: Refuse a since 'TBD' BEHAVIOR_CHANGES row
+      # A since: 'TBD' BEHAVIOR_CHANGES row never ships, and a release commit folds every changelog
+      # fragment and dates every behavior-change row (scripts/check-behavior-since.ts --stamped).
+      - name: Refuse a since 'TBD' row, an unfolded fragment or a stale behavior-change table
         run: bun scripts/check-behavior-since.ts --stamped
       - id: gate
         name: Wait for Test on the release commit
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
-        run: bun scripts/release-gate.ts --sha "$GITHUB_SHA" --version "$RELEASE_VERSION" --ref "$GITHUB_REF" --repo "$GITHUB_REPOSITORY" --output "$GITHUB_OUTPUT"
+        run: bun scripts/release-gate.ts --sha "$GITHUB_SHA" --version "$RELEASE_VERSION" --ref "$GITHUB_REF" --event "$GITHUB_EVENT_NAME" --repo "$GITHUB_REPOSITORY" --output "$GITHUB_OUTPUT"
 
   build:
     needs: [version, ci-gate]
